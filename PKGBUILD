@@ -1,7 +1,7 @@
 # Maintainer: Petexy <https://github.com/Petexy>
 
 pkgname=linpama
-pkgver=1.0.4.r
+pkgver=1.0.5.r
 pkgrel=1
 _currentdate=$(date +"%Y-%m-%d%H-%M-%S")
 pkgdesc="Linexin's Pacman and AUR Wrapper"

@@ -18,7 +18,7 @@ import signal
 gi.require_version("Gtk", "4.0")
 gi.require_version("Adw", "1")
 
-from gi.repository import Gtk, Adw, GLib, Pango, Gdk
+from gi.repository import Gtk, Adw, GLib, Pango, Gdk, Gio, GObject
 
 APP_NAME = "linpama"
 LOCALE_DIR = os.path.abspath("/usr/share/locale")
@@ -30,6 +30,16 @@ locale.bindtextdomain(APP_NAME, LOCALE_DIR)
 gettext.bindtextdomain(APP_NAME, LOCALE_DIR)
 gettext.textdomain(APP_NAME)
 _ = gettext.gettext
+
+class PackageObject(GObject.Object):
+    def __init__(self, name, repo, version, installed, desc, is_aur):
+        super().__init__()
+        self.name = name
+        self.repo = repo
+        self.version = version
+        self.installed = installed
+        self.desc = desc
+        self.is_aur = is_aur
 
 class LinexinPackageManager(Gtk.Box):
     def __init__(self, window=None):
@@ -57,10 +67,10 @@ class LinexinPackageManager(Gtk.Box):
         self.search_in_progress = False
         
         self.all_search_results = []
-        self.displayed_count = 0
-        self.batch_size = 30
+        self.store = Gio.ListStore(item_type=PackageObject)
         
         self.available_flatpak_ids = []
+        self.flatpak_suffix_map = {}
         self.setup_appstream_icon_paths()
         threading.Thread(target=self.load_all_flatpak_ids, daemon=True).start()
         
@@ -263,13 +273,16 @@ class LinexinPackageManager(Gtk.Box):
         self.results_scrolled = Gtk.ScrolledWindow()
         self.results_scrolled.set_policy(Gtk.PolicyType.AUTOMATIC, Gtk.PolicyType.AUTOMATIC)
         self.results_scrolled.set_vexpand(True)
-        self.results_scrolled.connect("edge-reached", self.on_scroll_edge_reached)
         
-        self.results_listbox = Gtk.ListBox()
-        self.results_listbox.add_css_class("boxed-list")
-        self.results_listbox.set_selection_mode(Gtk.SelectionMode.NONE)
+        self.selection_model = Gtk.NoSelection(model=self.store)
         
-        self.results_scrolled.set_child(self.results_listbox)
+        factory = Gtk.SignalListItemFactory()
+        factory.connect("setup", self.setup_list_item)
+        factory.connect("bind", self.bind_list_item)
+        
+        self.results_listview = Gtk.ListView(model=self.selection_model, factory=factory)
+        
+        self.results_scrolled.set_child(self.results_listview)
         self.search_stack.add_named(self.results_scrolled, "results")
         
         search_box.append(self.search_stack)
@@ -478,6 +491,12 @@ class LinexinPackageManager(Gtk.Box):
             
             if res.returncode == 0:
                 self.available_flatpak_ids = [line.strip() for line in res.stdout.split('\n') if line.strip()]
+                # Build lookup map for O(1) access
+                for fid in self.available_flatpak_ids:
+                    suffix = fid.split('.')[-1].lower()
+                    if suffix not in self.flatpak_suffix_map:
+                        self.flatpak_suffix_map[suffix] = []
+                    self.flatpak_suffix_map[suffix].append(fid)
         except Exception:
             pass
 
@@ -493,11 +512,9 @@ class LinexinPackageManager(Gtk.Box):
             
         pkg_lower = clean_name.lower()
         
-        matches = []
-        for fid in self.available_flatpak_ids:
-            fid_lower = fid.lower()
-            if fid_lower == pkg_lower or fid_lower.endswith(f".{pkg_lower}"):
-                matches.append(fid)
+
+        
+        matches = self.flatpak_suffix_map.get(pkg_lower, [])
 
         for fid in matches:
             if icon_theme.has_icon(fid):
@@ -618,78 +635,118 @@ class LinexinPackageManager(Gtk.Box):
 
     def update_results_initial(self):
         self.search_in_progress = False
-        self.clear_results()
         
         if not self.all_search_results:
+            self.store.remove_all()
             self.search_stack.set_visible_child_name("no_results")
             return
             
         self.search_stack.set_visible_child_name("results")
-        self.load_more_results()
-
-    def on_scroll_edge_reached(self, scrolled, pos):
-        if pos == Gtk.PositionType.BOTTOM:
-            self.load_more_results()
-
-    def load_more_results(self):
-        total = len(self.all_search_results)
-        if self.displayed_count >= total:
-            return
-
-        end_idx = min(self.displayed_count + self.batch_size, total)
-        batch = self.all_search_results[self.displayed_count:end_idx]
         
-        for pkg in batch:
-            row = self.create_package_row(pkg)
-            self.results_listbox.append(row)
-        
-        self.displayed_count = end_idx
+        new_items = []
+        for pkg in self.all_search_results:
+            new_items.append(PackageObject(
+                pkg['name'], pkg['repo'], pkg['version'], 
+                pkg['installed'], pkg['desc'], pkg.get('is_aur', False)
+            ))
+            
+        self.store.splice(0, self.store.get_n_items(), new_items)
 
-    def clear_results(self):
-        self.displayed_count = 0
-        child = self.results_listbox.get_first_child()
-        while child:
-            next_child = child.get_next_sibling()
-            self.results_listbox.remove(child)
-            child = next_child
-
-    def create_package_row(self, pkg):
+    def setup_list_item(self, factory, list_item):
         row = Adw.ActionRow()
-        row.set_title(pkg['name'])
-        row.set_subtitle(pkg['desc'])
         
-        icon_name = self.resolve_icon_name(pkg['name'])
-        icon_image = Gtk.Image.new_from_icon_name(icon_name)
-        icon_image.set_pixel_size(32)
-        row.add_prefix(icon_image)
+        icon = Gtk.Image()
+        icon.set_pixel_size(32)
+        row.add_prefix(icon)
+        row.icon_widget = icon 
         
-        ver_text = f"{pkg['version']} ({pkg['repo']})"
-        ver_label = Gtk.Label(label=ver_text)
+        ver_label = Gtk.Label()
         ver_label.add_css_class("dim-label")
         ver_label.set_margin_end(12)
         row.add_suffix(ver_label)
+        row.ver_label = ver_label
         
-        if pkg.get('is_aur'):
-            badge = Gtk.Label(label="AUR")
-            badge.add_css_class("caption")
-            badge.set_markup("<span background='#a40000' color='white' size='small'><b> AUR </b></span>")
-            badge.set_margin_end(8)
-            row.add_suffix(badge)
-
+        badge = Gtk.Label(label="AUR")
+        badge.add_css_class("caption")
+        badge.set_markup("<span background='#a40000' color='white' size='small'><b> AUR </b></span>")
+        badge.set_margin_end(8)
+        row.add_suffix(badge)
+        row.badge = badge
+        
         action_btn = Gtk.Button()
         action_btn.set_valign(Gtk.Align.CENTER)
-        
-        if pkg['installed']:
-            action_btn.set_label(_("Remove"))
-            action_btn.add_css_class("destructive-action")
-            action_btn.connect("clicked", lambda b, n=pkg['name']: self.initiate_remove(n))
-        else:
-            action_btn.set_label(_("Install"))
-            action_btn.add_css_class("suggested-action")
-            action_btn.connect("clicked", lambda b, p=pkg: self.initiate_install(p))
-            
         row.add_suffix(action_btn)
-        return row
+        row.action_btn = action_btn
+        
+        list_item.set_child(row)
+
+    def bind_list_item(self, factory, list_item):
+        row = list_item.get_child()
+        pkg = list_item.get_item()
+        
+        row.set_title(pkg.name)
+        row.set_subtitle(pkg.desc)
+        
+        icon_name = self.resolve_icon_name(pkg.name)
+        row.icon_widget.set_from_icon_name(icon_name)
+        
+        ver_text = f"{pkg.version} ({pkg.repo})"
+        row.ver_label.set_label(ver_text)
+        
+        row.badge.set_visible(pkg.is_aur)
+
+        if pkg.installed:
+            row.action_btn.set_label(_("Remove"))
+            row.action_btn.remove_css_class("suggested-action")
+            row.action_btn.add_css_class("destructive-action")
+            # We need to disconnect previous signal or use a wrapper? 
+            # Signals accumulate if we just connect again.
+            # Best way in bind is to use a helper that clears signals or use a single handler that checks current item
+            # BUT we don't have easy access to signal handler ID to disconnect.
+            # Workaround: Set data on the button to the current package name, and have ONE signal handler connected in setup
+        else:
+            row.action_btn.set_label(_("Install"))
+            row.action_btn.remove_css_class("destructive-action")
+            row.action_btn.add_css_class("suggested-action")
+            
+        # Connect signal in a way that handles recycling
+        # We'll leverage python's dynamic nature. 
+        # We can assign a callback to the button that captures the current pkg.
+        # But we need to avoid multiple connections.
+        # Disconnecting by ID is hard without storing ID. 
+        # Easier: The button triggers a method on `self` that checks `list_item.get_item()`
+        # But `list_item` is transient in bind? No, list_item is the GtkListItem.
+        
+        # We can store the current package on the row/button
+        row.action_btn.current_pkg = pkg
+        
+        # If we haven't connected the signal yet (checked via a tag), connect it once
+        if not getattr(row.action_btn, "connected", False):
+            row.action_btn.connect("clicked", self.on_item_action_clicked)
+            row.action_btn.connected = True
+
+    def on_item_action_clicked(self, btn):
+        pkg = btn.current_pkg
+        # Convert back to dict format expected by existing methods or update methods to accept object
+        # Existing methods expect a dict or just name.
+        # update `initiate_install` and `initiate_remove` to handle PackageObject
+        
+        pkg_dict = {
+            'name': pkg.name,
+            'repo': pkg.repo,
+            'version': pkg.version,
+            'installed': pkg.installed,
+            'desc': pkg.desc,
+            'is_aur': pkg.is_aur
+        }
+        
+        if pkg.installed:
+            self.initiate_remove(pkg.name)
+        else:
+            self.initiate_install(pkg_dict)
+
+    def clear_results(self):
+        self.store.remove_all()
 
     def initiate_install(self, pkg):
         self.action_type = "install"
@@ -990,7 +1047,9 @@ class LinexinPackageManager(Gtk.Box):
                  
             self.content_stack.set_visible_child_name("info_view")
             self.search_entry.set_text("") 
-            self.clear_results()
+            self.content_stack.set_visible_child_name("info_view")
+            self.search_entry.set_text("")
+            # Results cleared by search entry change
         else:
             self.revealer_details.set_reveal_child(True)
             self.btn_details.set_label(_("Hide Details"))
