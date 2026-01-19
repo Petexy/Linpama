@@ -51,4 +51,5 @@ translations = {
     "Please enter your password to search packages (requires repository update).": "कृपया पैकेज खोजने के लिए अपना पासवर्ड दर्ज करें (रिपॉजिटरी अपडेट की आवश्यकता है)।",
     "Please enter your password to update repositories.": "कृपया रिपॉजिटरी अपडेट करने के लिए अपना पासवर्ड दर्ज करें।",
     "Back to Search": "खोज पर वापस जाएं",
+    "Package Manager": "पैकेज प्रबंधक",
 }
