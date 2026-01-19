@@ -68,6 +68,8 @@ class LinexinPackageManager(Gtk.Box):
         
         self.all_search_results = []
         self.store = Gio.ListStore(item_type=PackageObject)
+        self.displayed_count = 0
+        self.batch_size = 50
         
         self.available_flatpak_ids = []
         self.flatpak_suffix_map = {}
@@ -252,10 +254,10 @@ class LinexinPackageManager(Gtk.Box):
         loading_box.set_valign(Gtk.Align.CENTER)
         loading_box.set_halign(Gtk.Align.CENTER)
         
-        spinner = Gtk.Spinner()
-        spinner.set_size_request(48, 48)
-        spinner.start()
-        loading_box.append(spinner)
+        self.spinner = Gtk.Spinner()
+        self.spinner.set_size_request(48, 48)
+        self.spinner.start()
+        loading_box.append(self.spinner)
         
         loading_lbl = Gtk.Label(label=_("Searching..."))
         loading_lbl.add_css_class("title-4")
@@ -273,6 +275,7 @@ class LinexinPackageManager(Gtk.Box):
         self.results_scrolled = Gtk.ScrolledWindow()
         self.results_scrolled.set_policy(Gtk.PolicyType.AUTOMATIC, Gtk.PolicyType.AUTOMATIC)
         self.results_scrolled.set_vexpand(True)
+        self.results_scrolled.connect("edge-reached", self.on_scroll_edge_reached)
         
         self.selection_model = Gtk.NoSelection(model=self.store)
         
@@ -550,9 +553,11 @@ class LinexinPackageManager(Gtk.Box):
 
     def trigger_search(self, query, search_id):
         self.search_stack.set_visible_child_name("loading")
+        self.spinner.start()
         self.search_in_progress = True
         self.all_search_results = []
         self.displayed_count = 0
+        self.store.remove_all()
         
         threading.Thread(
             target=self.perform_search, 
@@ -635,6 +640,7 @@ class LinexinPackageManager(Gtk.Box):
 
     def update_results_initial(self):
         self.search_in_progress = False
+        self.spinner.stop()
         
         if not self.all_search_results:
             self.store.remove_all()
@@ -642,15 +648,29 @@ class LinexinPackageManager(Gtk.Box):
             return
             
         self.search_stack.set_visible_child_name("results")
+        self.load_more_results()
+
+    def on_scroll_edge_reached(self, scrolled, pos):
+        if pos == Gtk.PositionType.BOTTOM:
+            self.load_more_results()
+
+    def load_more_results(self):
+        total = len(self.all_search_results)
+        if self.displayed_count >= total:
+            return
+
+        end_idx = min(self.displayed_count + self.batch_size, total)
+        batch = self.all_search_results[self.displayed_count:end_idx]
         
         new_items = []
-        for pkg in self.all_search_results:
+        for pkg in batch:
             new_items.append(PackageObject(
                 pkg['name'], pkg['repo'], pkg['version'], 
                 pkg['installed'], pkg['desc'], pkg.get('is_aur', False)
             ))
             
-        self.store.splice(0, self.store.get_n_items(), new_items)
+        self.store.splice(self.store.get_n_items(), 0, new_items)
+        self.displayed_count = end_idx
 
     def setup_list_item(self, factory, list_item):
         row = Adw.ActionRow()
@@ -746,6 +766,7 @@ class LinexinPackageManager(Gtk.Box):
             self.initiate_install(pkg_dict)
 
     def clear_results(self):
+        self.displayed_count = 0
         self.store.remove_all()
 
     def initiate_install(self, pkg):
@@ -773,7 +794,7 @@ class LinexinPackageManager(Gtk.Box):
         self.repo_update_error = None
         try:
              self.setup_sudo_env()
-             update_cmd = f"{self.sudo_wrapper} pacman -Sy"
+             update_cmd = [self.sudo_wrapper, "pacman", "-Sy"]
              
              env = os.environ.copy()
              env['LC_ALL'] = 'C'
@@ -781,7 +802,7 @@ class LinexinPackageManager(Gtk.Box):
                  env_var_name = f"{APP_NAME.upper().replace('-', '_')}_SUDO_PW"
                  env[env_var_name] = self.user_password
 
-             proc = subprocess.run(update_cmd, shell=True, capture_output=True, text=True, env=env)
+             proc = subprocess.run(update_cmd, capture_output=True, text=True, env=env)
              
              if proc.returncode != 0:
                  err_msg = proc.stderr
@@ -881,9 +902,12 @@ class LinexinPackageManager(Gtk.Box):
         self.pulse_timer_id = GLib.timeout_add(100, self.pulse_progress)
         self.current_package_name = self.aur_pkg_name
         
-        cmd = f"cd {self.aur_temp_dir} && export SUDO_ASKPASS='{self.askpass_script}' && makepkg -si --noconfirm"
+        # Security fix: Use direct command list and env/cwd instead of shell chaining
+        cmd = ["makepkg", "-si", "--noconfirm"]
         
-        threading.Thread(target=self.execute_shell, args=(cmd, self.aur_pkg_name), daemon=True).start()
+        env_extra = {'SUDO_ASKPASS': self.askpass_script}
+        
+        threading.Thread(target=self.execute_shell, args=(cmd, self.aur_pkg_name, self.aur_temp_dir, env_extra), daemon=True).start()
 
     def prompt_for_password(self, callback_success):
         root = self.get_root() or self.window
@@ -973,11 +997,11 @@ class LinexinPackageManager(Gtk.Box):
         if self.action_type == "remove":
             self.progress_title.set_text(_("Removing {}...").format(package_name))
             self.lbl_progress_status.set_text(_("Removing package..."))
-            cmd = f"{self.sudo_wrapper} pacman -Rns --noconfirm {package_name}"
+            cmd = [self.sudo_wrapper, "pacman", "-Rns", "--noconfirm", package_name]
         else:
             self.progress_title.set_text(_("Installing {}...").format(package_name))
             self.lbl_progress_status.set_text(_("Downloading and installing..."))
-            cmd = f"{self.sudo_wrapper} pacman -S --noconfirm --needed {package_name}"
+            cmd = [self.sudo_wrapper, "pacman", "-S", "--noconfirm", "--needed", package_name]
         
         threading.Thread(target=self.execute_shell, args=(cmd, package_name), daemon=True).start()
 
@@ -985,7 +1009,7 @@ class LinexinPackageManager(Gtk.Box):
         self.progress_bar.pulse()
         return True
 
-    def execute_shell(self, command, pkg_name):
+    def execute_shell(self, command, pkg_name, cwd=None, env_extra=None):
         success = False
         try:
             env = os.environ.copy()
@@ -994,10 +1018,13 @@ class LinexinPackageManager(Gtk.Box):
                 env_var_name = f"{APP_NAME.upper().replace('-', '_')}_SUDO_PW"
                 env[env_var_name] = self.user_password
             
-            self.current_process = subprocess.Popen(command, shell=True, 
+            if env_extra:
+                env.update(env_extra)
+            
+            self.current_process = subprocess.Popen(command, 
                                      stdout=subprocess.PIPE, 
                                      stderr=subprocess.STDOUT, 
-                                     text=True, env=env)
+                                     text=True, env=env, cwd=cwd)
             
             for line in iter(self.current_process.stdout.readline, ''):
                 if line:
