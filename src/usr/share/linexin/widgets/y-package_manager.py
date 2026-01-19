@@ -215,8 +215,14 @@ class LinexinPackageManager(Gtk.Box):
         self.search_entry.connect("search-changed", self.on_search_changed)
         header_box.append(self.search_entry)
         
+        self.refresh_btn = Gtk.Button(icon_name="view-refresh-symbolic")
+        self.refresh_btn.set_tooltip_text(_("Refresh Repositories"))
+        self.refresh_btn.connect("clicked", self.on_refresh_repos_clicked)
+        header_box.append(self.refresh_btn)
+
         self.aur_check = Gtk.CheckButton(label=_("Search AUR"))
         self.aur_check.set_tooltip_text(_("Search Arch User Repository (Unstable/Community packages)"))
+        self.aur_check.connect("toggled", lambda b: self.on_search_changed(self.search_entry))
         header_box.append(self.aur_check)
         
         search_box.append(header_box)
@@ -686,17 +692,58 @@ class LinexinPackageManager(Gtk.Box):
         if pkg.get('is_aur'):
             self.start_aur_review_process(pkg['name'])
         else:
-            if not self.user_password:
-                self.prompt_for_password(lambda: self.run_transaction(pkg['name']))
-            else:
-                self.run_transaction(pkg['name'])
+            self.prompt_for_password(lambda: self.run_transaction(pkg['name']))
 
     def initiate_remove(self, package_name):
         self.action_type = "remove"
-        if not self.user_password:
-            self.prompt_for_password(lambda: self.run_transaction(package_name))
-        else:
-            self.run_transaction(package_name)
+        self.prompt_for_password(lambda: self.run_transaction(package_name))
+
+    def on_refresh_repos_clicked(self, btn):
+        self.action_type = "refresh"
+        self.prompt_for_password(lambda: self.run_repo_update())
+
+    def run_repo_update(self):
+        self.refresh_btn.set_sensitive(False)
+        threading.Thread(target=self._update_repo_thread, daemon=True).start()
+
+    def _update_repo_thread(self):
+        self.repo_update_error = None
+        try:
+             self.setup_sudo_env()
+             update_cmd = f"{self.sudo_wrapper} pacman -Sy"
+             
+             env = os.environ.copy()
+             env['LC_ALL'] = 'C'
+             if self.user_password:
+                 env_var_name = f"{APP_NAME.upper().replace('-', '_')}_SUDO_PW"
+                 env[env_var_name] = self.user_password
+
+             proc = subprocess.run(update_cmd, shell=True, capture_output=True, text=True, env=env)
+             
+             if proc.returncode != 0:
+                 err_msg = proc.stderr
+                 if "Sorry, try again" in err_msg or "sudo: no password was provided" in err_msg:
+                     self.repo_update_error = _("Incorrect Password")
+                 else:
+                     self.repo_update_error = _("Repository update failed")
+                     print(f"Repo update stderr: {proc.stderr}")
+
+        except Exception as e:
+             self.repo_update_error = str(e)
+             print(f"Repo update failed: {e}")
+        
+        GLib.idle_add(self._on_repo_update_finished)
+
+    def _on_repo_update_finished(self):
+        self.refresh_btn.set_sensitive(True)
+        if self.repo_update_error:
+            dialog = Adw.MessageDialog(
+                heading=_("Update Failed"),
+                body=self.repo_update_error,
+                transient_for=self.get_root() or self.window
+            )
+            dialog.add_response("ok", _("OK"))
+            dialog.present()
 
     def start_aur_review_process(self, package_name):
         self.aur_temp_dir = tempfile.mkdtemp(prefix=f"{APP_NAME}_aur_")
@@ -748,10 +795,7 @@ class LinexinPackageManager(Gtk.Box):
         self.content_stack.set_visible_child_name("search_view")
 
     def on_pkgbuild_proceed(self, btn):
-        if not self.user_password:
-             self.prompt_for_password(lambda: self.run_aur_build())
-        else:
-             self.run_aur_build()
+        self.prompt_for_password(lambda: self.run_aur_build())
 
     def run_aur_build(self):
         self.setup_sudo_env()
@@ -776,7 +820,10 @@ class LinexinPackageManager(Gtk.Box):
         root = self.get_root() or self.window
         
         action_label = _("install") if getattr(self, "action_type", "install") == "install" else _("remove")
-        body_text = _("Please enter your password to {} this package.").format(action_label)
+        if getattr(self, "action_type", "install") == "refresh":
+             body_text = _("Please enter your password to update repositories.")
+        else:
+             body_text = _("Please enter your password to {} this package.").format(action_label)
         
         dialog = Adw.MessageDialog(
             heading=_("Authentication Required"),
@@ -806,8 +853,27 @@ class LinexinPackageManager(Gtk.Box):
         dialog.present()
 
     def setup_sudo_env(self):
+        # Marker file to ensure sudo only tries the password once
+        marker_file = f"/tmp/{APP_NAME}-askpass.marker"
+        if os.path.exists(marker_file):
+            try:
+                os.remove(marker_file)
+            except OSError:
+                pass
+        
         with open(self.askpass_script, "w") as f:
-            f.write(f"#!/bin/sh\necho \"${APP_NAME.upper().replace('-', '_')}_SUDO_PW\"\n")
+            # Script checks for marker. If exists, it means we already tried once -> exit error.
+            # If not, create marker and output password.
+            script_content = (
+                "#!/bin/sh\n"
+                f"MARKER='{marker_file}'\n"
+                "if [ -f \"$MARKER\" ]; then\n"
+                "    exit 1\n"
+                "fi\n"
+                "touch \"$MARKER\"\n"
+                f"echo \"${APP_NAME.upper().replace('-', '_')}_SUDO_PW\"\n"
+            )
+            f.write(script_content)
         os.chmod(self.askpass_script, 0o700)
         
         with open(self.sudo_wrapper, "w") as f:
@@ -848,6 +914,7 @@ class LinexinPackageManager(Gtk.Box):
         success = False
         try:
             env = os.environ.copy()
+            env['LC_ALL'] = 'C'
             if self.user_password:
                 env_var_name = f"{APP_NAME.upper().replace('-', '_')}_SUDO_PW"
                 env[env_var_name] = self.user_password
@@ -903,7 +970,16 @@ class LinexinPackageManager(Gtk.Box):
         else:
             self.revealer_details.set_reveal_child(True)
             self.btn_details.set_label(_("Hide Details"))
-            self.lbl_progress_status.set_text(_("Failed or Cancelled."))
+            
+            # Check logs for password failure
+            start, end = self.output_buffer.get_bounds()
+            log_content = self.output_buffer.get_text(start, end, True)
+            
+            status_msg = _("Failed or Cancelled.")
+            if "Sorry, try again" in log_content or "incorrect password" in log_content.lower() or "sudo: no password was provided" in log_content.lower():
+                status_msg = _("Incorrect Password.")
+            
+            self.lbl_progress_status.set_text(status_msg)
             self.btn_back.set_sensitive(True)
             self.btn_cancel.set_visible(False)
             self.append_log(f"\n\n{_('Transaction Failed.')}")
