@@ -274,7 +274,8 @@ class LinexinPackageManager(Gtk.Box):
         
         search_box.append(self.search_stack)
         
-        self.search_stack.set_visible_child_name("welcome")
+        # Trigger initial search to list installed packages
+        self.on_search_changed(self.search_entry)
         
         self.content_stack.add_named(search_box, "search_view")
 
@@ -526,10 +527,7 @@ class LinexinPackageManager(Gtk.Box):
         self.search_counter += 1
         current_search_id = self.search_counter
         
-        if len(query) < 2:
-            self.clear_results()
-            self.search_stack.set_visible_child_name("welcome")
-            return
+
 
         self.search_timer = GLib.timeout_add(400, self.trigger_search, query, current_search_id)
 
@@ -551,7 +549,12 @@ class LinexinPackageManager(Gtk.Box):
 
         results = []
         try:
-            cmd = ["pacman", "-Ss", query]
+            if not query:
+                # If query is empty, list all installed packages
+                cmd = ["pacman", "-Qs"]
+            else:
+                cmd = ["pacman", "-Ss", query]
+                
             process = subprocess.run(cmd, capture_output=True, text=True, env={'LC_ALL': 'C'})
             
             if search_id != self.search_counter: return
@@ -569,7 +572,9 @@ class LinexinPackageManager(Gtk.Box):
                         version = parts[1]
                         
                         repo, name = full_name.split('/') if '/' in full_name else ("local", full_name)
-                        installed = "[installed]" in line
+                        
+                        # pacman -Qs output implies installed, -Ss output has [installed] tag
+                        installed = not query or "[installed]" in line
                         
                         current_pkg = {
                             'name': name, 'repo': repo,
@@ -584,7 +589,8 @@ class LinexinPackageManager(Gtk.Box):
         except Exception as e:
             print(f"Repo search error: {e}")
 
-        if self.aur_check.get_active():
+        # Only search AUR if there is a query string
+        if query and self.aur_check.get_active():
             try:
                 rpc_url = f"https://aur.archlinux.org/rpc/?v=5&type=search&arg={urllib.parse.quote(query)}"
                 with urllib.request.urlopen(rpc_url, timeout=5) as response:
@@ -723,7 +729,7 @@ class LinexinPackageManager(Gtk.Box):
              if proc.returncode != 0:
                  err_msg = proc.stderr
                  if "Sorry, try again" in err_msg or "sudo: no password was provided" in err_msg:
-                     self.repo_update_error = _("Incorrect Password")
+                     self.repo_update_error = _("Incorrect sudo password. Please try again.")
                  else:
                      self.repo_update_error = _("Repository update failed")
                      print(f"Repo update stderr: {proc.stderr}")
@@ -735,6 +741,12 @@ class LinexinPackageManager(Gtk.Box):
         GLib.idle_add(self._on_repo_update_finished)
 
     def _on_repo_update_finished(self):
+        # Invalidate sudo cache
+        try:
+            subprocess.run(["sudo", "-k"], check=False)
+        except Exception:
+            pass
+            
         self.refresh_btn.set_sensitive(True)
         if self.repo_update_error:
             dialog = Adw.MessageDialog(
@@ -853,6 +865,12 @@ class LinexinPackageManager(Gtk.Box):
         dialog.present()
 
     def setup_sudo_env(self):
+        # Invalidate sudo cache to ensure password is always required
+        try:
+            subprocess.run(["sudo", "-k"], check=False)
+        except Exception:
+            pass
+            
         # Marker file to ensure sudo only tries the password once
         marker_file = f"/tmp/{APP_NAME}-askpass.marker"
         if os.path.exists(marker_file):
@@ -944,6 +962,12 @@ class LinexinPackageManager(Gtk.Box):
         return False
 
     def on_process_finished(self, success, pkg_name):
+        # Invalidate sudo cache
+        try:
+            subprocess.run(["sudo", "-k"], check=False)
+        except Exception:
+            pass
+            
         self.process_in_progress = False
         self.current_process = None
         
@@ -977,7 +1001,7 @@ class LinexinPackageManager(Gtk.Box):
             
             status_msg = _("Failed or Cancelled.")
             if "Sorry, try again" in log_content or "incorrect password" in log_content.lower() or "sudo: no password was provided" in log_content.lower():
-                status_msg = _("Incorrect Password.")
+                status_msg = _("Incorrect sudo password. Please try again.")
             
             self.lbl_progress_status.set_text(status_msg)
             self.btn_back.set_sensitive(True)

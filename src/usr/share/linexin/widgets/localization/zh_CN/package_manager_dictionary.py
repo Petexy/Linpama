@@ -49,7 +49,8 @@ translations = {
     "Transaction Failed.": "事务失败。",
     "Failed or Cancelled.": "失败或已取消。",
     "Please enter your password to search packages (requires repository update).": "请输入密码以搜索软件包（需要更新仓库）。",
-    "Please enter your password to update repositories.": "请输入密码以更新仓库。",
+    "Please enter your password to update repositories.": "请输入您的密码以更新存储库。",
+    "Incorrect sudo password. Please try again.": "sudo 密码不正确。请重试。",
     "Back to Search": "返回搜索",
     "Package Manager": "软件包管理器",
 }

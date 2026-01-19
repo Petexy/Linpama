@@ -50,6 +50,7 @@ translations = {
     "Failed or Cancelled.": "Ошибка или отмена.",
     "Please enter your password to search packages (requires repository update).": "Пожалуйста, введите пароль для поиска пакетов (требуется обновление репозиториев).",
     "Please enter your password to update repositories.": "Пожалуйста, введите пароль для обновления репозиториев.",
+    "Incorrect sudo password. Please try again.": "Неверный пароль sudo. Пожалуйста, попробуйте еще раз.",
     "Back to Search": "Вернуться к поиску",
     "Package Manager": "Менеджер пакетов",
 }

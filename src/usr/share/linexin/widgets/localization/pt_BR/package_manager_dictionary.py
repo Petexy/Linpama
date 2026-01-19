@@ -50,6 +50,7 @@ translations = {
     "Failed or Cancelled.": "Falhou ou Cancelado.",
     "Please enter your password to search packages (requires repository update).": "Por favor, digite sua senha para pesquisar pacotes (requer atualização do repositório).",
     "Please enter your password to update repositories.": "Por favor, digite sua senha para atualizar os repositórios.",
-    "Back to Search": "Voltar para Pesquisa",
+    "Incorrect sudo password. Please try again.": "Senha sudo incorreta. Por favor, tente novamente.",
+    "Back to Search": "Voltar para a pesquisa",
     "Package Manager": "Gerenciador de Pacotes",
 }
