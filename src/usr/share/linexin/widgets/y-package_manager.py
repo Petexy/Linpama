@@ -612,6 +612,8 @@ class LinexinPackageManager(Gtk.Box):
         threading.Thread(target=self._update_repo_thread, daemon=True).start()
     def _update_repo_thread(self):
         self.repo_update_error = None
+        if sudo_manager:
+            sudo_manager.start_privileged_session()
         try:
              sudo_wrap = sudo_manager.wrapper_path
              update_cmd = [sudo_wrap, "pacman", "-Sy"]
@@ -628,6 +630,9 @@ class LinexinPackageManager(Gtk.Box):
         except Exception as e:
              self.repo_update_error = str(e)
              print(f"Repo update failed: {e}")
+        
+        if sudo_manager:
+            sudo_manager.stop_privileged_session()
         GLib.idle_add(self._on_repo_update_finished)
     def _on_repo_update_finished(self):
         if sudo_manager:
@@ -772,6 +777,8 @@ class LinexinPackageManager(Gtk.Box):
         return True
     def execute_shell(self, command, pkg_name, cwd=None, env_extra=None):
         success = False
+        if sudo_manager:
+            sudo_manager.start_privileged_session()
         try:
             env = sudo_manager.get_env()
             env['LC_ALL'] = 'C'
@@ -799,6 +806,7 @@ class LinexinPackageManager(Gtk.Box):
         return False
     def on_process_finished(self, success, pkg_name):
         if sudo_manager:
+            sudo_manager.stop_privileged_session()
             sudo_manager.forget_password()
         self.process_in_progress = False
         self.current_process = None
