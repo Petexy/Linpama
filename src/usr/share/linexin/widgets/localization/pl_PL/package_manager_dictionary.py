@@ -1,5 +1,4 @@
 translations = {
-    # Linpama Widget strings
     "System Updater": "Aktualizator Systemu",
     "Open GNOME Software instead": "Otwórz oprogramowanie GNOME zamiast tego",
     "Open Discover instead": "Otwórz Discover zamiast tego",
