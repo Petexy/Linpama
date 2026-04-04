@@ -53,4 +53,5 @@ translations = {
     "Incorrect sudo password. Please try again.": "Nieprawidłowe hasło sudo. Spróbuj ponownie.",
     "Back to Search": "Powrót do wyszukiwania",
     "Package Manager": "Menedżer Pakietów",
+    "Fetching {} from AUR...": "Fetching {} from AUR...",
 }

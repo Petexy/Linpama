@@ -35,7 +35,7 @@ class PackageObject(GObject.Object):
         self.desc = desc
         self.is_aur = is_aur
 class LinexinPackageManager(Gtk.Box):
-    def __init__(self, window=None):
+    def __init__(self, hide_sidebar=False, window=None):
         super().__init__(orientation=Gtk.Orientation.VERTICAL, spacing=12)
         self.widgetname = "Package Manager"
         self.widgeticon = "/usr/share/icons/github.petexy.linpama.svg" 
@@ -60,7 +60,6 @@ class LinexinPackageManager(Gtk.Box):
         self.available_flatpak_ids = []
         self.flatpak_suffix_map = {}
         self.setup_appstream_icon_paths()
-        threading.Thread(target=self.load_all_flatpak_ids, daemon=True).start()
         threading.Thread(target=self.load_all_flatpak_ids, daemon=True).start()
         self.content_stack = Gtk.Stack()
         self.content_stack.set_transition_type(Gtk.StackTransitionType.SLIDE_LEFT_RIGHT)
@@ -157,7 +156,7 @@ class LinexinPackageManager(Gtk.Box):
             store_btn.add_css_class("suggested-action")
             store_btn.add_css_class("buttons_all")
             store_btn.set_halign(Gtk.Align.CENTER) 
-            store_btn.connect("clicked", lambda x: subprocess.Popen(cmd))
+            store_btn.connect("clicked", lambda x: subprocess.Popen([cmd]))
             btn_box.append(store_btn)
         continue_btn = Gtk.Button(label=_("I Understand, Continue"))
         continue_btn.add_css_class("flat")
@@ -388,7 +387,7 @@ class LinexinPackageManager(Gtk.Box):
     def load_all_flatpak_ids(self):
         try:
             cmd = ["flatpak", "remote-ls", "--app", "--columns=application"]
-            res = subprocess.run(cmd, capture_output=True, text=True, env={'LC_ALL': 'C'})
+            res = subprocess.run(cmd, capture_output=True, text=True, env={**os.environ, 'LC_ALL': 'C'})
             if res.returncode == 0:
                 self.available_flatpak_ids = [line.strip() for line in res.stdout.split('\n') if line.strip()]
                 for fid in self.available_flatpak_ids:
@@ -402,7 +401,7 @@ class LinexinPackageManager(Gtk.Box):
         icon_theme = Gtk.IconTheme.get_for_display(Gdk.Display.get_default())
         if icon_theme.has_icon(package_name):
             return package_name
-        clean_name = re.sub(r'^(-bin|-git|-nightly|-stable|-beta)|(-bin|-git|-nightly|-stable|-beta)$', '', package_name)
+        clean_name = re.sub(r'(-bin|-git|-nightly|-stable|-beta)$', '', package_name)
         if clean_name != package_name and icon_theme.has_icon(clean_name):
             return clean_name
         pkg_lower = clean_name.lower()
@@ -451,7 +450,7 @@ class LinexinPackageManager(Gtk.Box):
                 cmd = ["pacman", "-Qs"]
             else:
                 cmd = ["pacman", "-Ss", query]
-            process = subprocess.run(cmd, capture_output=True, text=True, env={'LC_ALL': 'C'})
+            process = subprocess.run(cmd, capture_output=True, text=True, env={**os.environ, 'LC_ALL': 'C'})
             if search_id != self.search_counter: return
             if process.returncode == 0 and process.stdout:
                 lines = process.stdout.strip().split('\n')
@@ -477,7 +476,7 @@ class LinexinPackageManager(Gtk.Box):
             print(f"Repo search error: {e}")
         installed_pkgs = set()
         try:
-            p_q = subprocess.run(["pacman", "-Qq"], capture_output=True, text=True, env={'LC_ALL': 'C'})
+            p_q = subprocess.run(["pacman", "-Qq"], capture_output=True, text=True, env={**os.environ, 'LC_ALL': 'C'})
             if p_q.returncode == 0:
                 installed_pkgs = set(p_q.stdout.strip().split('\n'))
         except:
@@ -637,6 +636,7 @@ class LinexinPackageManager(Gtk.Box):
     def _on_repo_update_finished(self):
         if sudo_manager:
             sudo_manager.forget_password()
+        self.user_password = None
         self.refresh_btn.set_sensitive(True)
         if self.repo_update_error:
             dialog = Adw.MessageDialog(
@@ -645,13 +645,14 @@ class LinexinPackageManager(Gtk.Box):
                 transient_for=self.get_root() or self.window
             )
             dialog.add_response("ok", _("OK"))
+            translate_dialog(dialog)
             dialog.present()
     def start_aur_review_process(self, package_name):
         self.aur_temp_dir = tempfile.mkdtemp(prefix=f"{APP_NAME}_aur_")
         self.aur_pkg_name = package_name
         self.current_package_name = package_name
         self.content_stack.set_visible_child_name("progress_view")
-        self.output_buffer.set_text(f"Fetching {package_name} from AUR...")
+        self.output_buffer.set_text(_("Fetching {} from AUR...").format(package_name))
         self.btn_back.set_sensitive(False)
         self.btn_cancel.set_visible(True)
         self.progress_bar.pulse()
@@ -746,10 +747,12 @@ class LinexinPackageManager(Gtk.Box):
                             transient_for=self.get_root() or self.window
                         )
                         err_dialog.add_response("ok", _("OK"))
+                        translate_dialog(err_dialog)
                         err_dialog.present()
             dialog.close()
         dialog.connect("response", on_response)
         entry.connect("activate", lambda w: dialog.response("unlock"))
+        translate_dialog(dialog)
         dialog.present()
     def run_transaction(self, package_name):
         self.content_stack.set_visible_child_name("progress_view")
@@ -808,6 +811,7 @@ class LinexinPackageManager(Gtk.Box):
         if sudo_manager:
             sudo_manager.stop_privileged_session()
             sudo_manager.forget_password()
+        self.user_password = None
         self.process_in_progress = False
         self.current_process = None
         if self.pulse_timer_id:
@@ -823,8 +827,6 @@ class LinexinPackageManager(Gtk.Box):
                  self.info_text.set_text(_("Successfully removed {}").format(pkg_name))
             else:
                  self.info_text.set_text(_("Successfully installed {}").format(pkg_name))
-            self.content_stack.set_visible_child_name("info_view")
-            self.search_entry.set_text("") 
             self.content_stack.set_visible_child_name("info_view")
             self.search_entry.set_text("")
         else:
