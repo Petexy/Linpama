@@ -1,7 +1,7 @@
 # Maintainer: Petexy <https://github.com/Petexy>
 
 pkgname=linpama
-pkgver=1.2.0.r
+pkgver=2.0.0.r
 pkgrel=1
 _currentdate=$(date +"%Y-%m-%d%H-%M-%S")
 pkgdesc="Linexin's Pacman and AUR Wrapper"
@@ -14,6 +14,7 @@ depends=(
   libadwaita
   linexin-center
   wget
+  webkitgtk-6.0
 )
 makedepends=(
 )

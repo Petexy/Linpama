@@ -13,13 +13,25 @@ import urllib.parse
 import shutil
 import tempfile
 import signal
+import html as html_module
 gi.require_version("Gtk", "4.0")
 gi.require_version("Adw", "1")
+try:
+    gi.require_version("WebKit", "6.0")
+    from gi.repository import WebKit
+    WEBKIT_AVAILABLE = True
+except Exception:
+    WEBKIT_AVAILABLE = False
 from gi.repository import Gtk, Adw, GLib, Pango, Gdk, Gio, GObject
 APP_NAME = "linpama"
 LOCALE_DIR = os.path.abspath("/usr/share/locale")
 CONFIG_DIR = os.path.expanduser(f"~/.config/{APP_NAME}")
 CONFIG_FILE = os.path.join(CONFIG_DIR, "config.json")
+WIDE_LAYOUT_THRESHOLD = 900
+WIDE_LAYOUT_SIDE_PADDING = 12
+LEFT_PANE_MIN_WIDTH = 400
+RIGHT_PANE_MIN_WIDTH = 300
+LAYOUT_ANIMATION_DURATION = 350
 locale.setlocale(locale.LC_ALL, '')
 locale.bindtextdomain(APP_NAME, LOCALE_DIR)
 gettext.bindtextdomain(APP_NAME, LOCALE_DIR)
@@ -44,6 +56,7 @@ class LinexinPackageManager(Gtk.Box):
         self.set_margin_start(12)
         self.set_margin_end(12)
         self.window = window
+        self.hide_sidebar = hide_sidebar
         self.user_password = None
         self.process_in_progress = False
         self.pulse_timer_id = None
@@ -61,16 +74,34 @@ class LinexinPackageManager(Gtk.Box):
         self.flatpak_suffix_map = {}
         self.setup_appstream_icon_paths()
         threading.Thread(target=self.load_all_flatpak_ids, daemon=True).start()
+        self.wide_layout_enabled = None
+        self.last_measured_width = 0
+        self.main_layout_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=12)
+        self.main_layout_box.set_hexpand(True)
+        self.main_layout_box.set_vexpand(True)
+        self.content_hbox = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=0)
+        self.content_hbox.set_hexpand(True)
+        self.content_hbox.set_vexpand(True)
+        self.right_revealer = Gtk.Revealer()
+        self.right_revealer.set_transition_type(Gtk.RevealerTransitionType.SLIDE_LEFT)
+        self.right_revealer.set_transition_duration(LAYOUT_ANIMATION_DURATION)
+        self.right_revealer.set_reveal_child(True)
+        self.right_revealer.set_hexpand(False)
+        self.right_revealer.set_vexpand(True)
         self.content_stack = Gtk.Stack()
         self.content_stack.set_transition_type(Gtk.StackTransitionType.SLIDE_LEFT_RIGHT)
         self.content_stack.set_hexpand(True)
         self.content_stack.set_vexpand(True)
-        self.append(self.content_stack)
+        self.append(self.main_layout_box)
         self.setup_warning_view()
         self.setup_search_view()
         self.setup_pkgbuild_view()
         self.setup_progress_view()
         self.setup_info_view()
+        self.setup_right_pane()
+        self.update_adaptive_layout(force=True)
+        GLib.timeout_add(200, self._monitor_adaptive_layout)
+        self.connect("unrealize", self._on_unrealize)
         if self.should_show_warning():
             self.content_stack.set_visible_child_name("warning_view")
         else:
@@ -83,12 +114,23 @@ class LinexinPackageManager(Gtk.Box):
                 min-width: 200px;
                 min-height: 40px;
             }
+            .rounded-list {
+                border-radius: 12px;
+            }
         """)
         Gtk.StyleContext.add_provider_for_display(
             Gdk.Display.get_default(), 
             css_provider, 
             Gtk.STYLE_PROVIDER_PRIORITY_APPLICATION
         )
+    def _on_unrealize(self, widget):
+        if WEBKIT_AVAILABLE and hasattr(self, 'detail_webview'):
+            try:
+                self.detail_webview.stop_loading()
+                self.detail_webview.load_uri("about:blank")
+                self.detail_webview.terminate_web_process()
+            except Exception:
+                pass
     def should_show_warning(self):
         if not os.path.exists(CONFIG_FILE):
             return True
@@ -183,14 +225,16 @@ class LinexinPackageManager(Gtk.Box):
         self.search_entry.set_hexpand(True)
         self.search_entry.connect("search-changed", self.on_search_changed)
         header_box.append(self.search_entry)
-        self.refresh_btn = Gtk.Button(icon_name="view-refresh-symbolic")
-        self.refresh_btn.set_tooltip_text(_("Refresh Repositories"))
-        self.refresh_btn.connect("clicked", self.on_refresh_repos_clicked)
-        header_box.append(self.refresh_btn)
         self.aur_check = Gtk.CheckButton(label=_("Search AUR"))
         self.aur_check.set_tooltip_text(_("Search Arch User Repository (Unstable/Community packages)"))
         self.aur_check.connect("toggled", lambda b: self.on_search_changed(self.search_entry))
         header_box.append(self.aur_check)
+        self.compact_sidebar_btn = Gtk.ToggleButton()
+        self.compact_sidebar_btn.set_icon_name("sidebar-show-right-symbolic")
+        self.compact_sidebar_btn.set_tooltip_text(_("Show Actions"))
+        self.compact_sidebar_btn.set_active(True)
+        self._sidebar_toggled_handler = self.compact_sidebar_btn.connect("toggled", self._on_sidebar_btn_toggled)
+        header_box.append(self.compact_sidebar_btn)
         search_box.append(header_box)
         self.search_stack = Gtk.Stack()
         self.search_stack.set_transition_type(Gtk.StackTransitionType.CROSSFADE)
@@ -218,17 +262,26 @@ class LinexinPackageManager(Gtk.Box):
         no_results_page.set_description(_("Try refining your search terms."))
         no_results_page.set_vexpand(True)
         self.search_stack.add_named(no_results_page, "no_results")
+        self.list_detail_stack = Gtk.Stack()
+        self.list_detail_stack.set_transition_duration(300)
+        self.list_detail_stack.set_vexpand(True)
         self.results_scrolled = Gtk.ScrolledWindow()
         self.results_scrolled.set_policy(Gtk.PolicyType.AUTOMATIC, Gtk.PolicyType.AUTOMATIC)
         self.results_scrolled.set_vexpand(True)
+        self.results_scrolled.add_css_class("rounded-list")
+        self.results_scrolled.set_overflow(Gtk.Overflow.HIDDEN)
         self.results_scrolled.connect("edge-reached", self.on_scroll_edge_reached)
         self.selection_model = Gtk.NoSelection(model=self.store)
         factory = Gtk.SignalListItemFactory()
         factory.connect("setup", self.setup_list_item)
         factory.connect("bind", self.bind_list_item)
         self.results_listview = Gtk.ListView(model=self.selection_model, factory=factory)
+        self.results_listview.set_single_click_activate(True)
+        self.results_listview.connect("activate", self.on_listview_item_activate)
         self.results_scrolled.set_child(self.results_listview)
-        self.search_stack.add_named(self.results_scrolled, "results")
+        self.list_detail_stack.add_named(self.results_scrolled, "list")
+        self._build_detail_page()
+        self.search_stack.add_named(self.list_detail_stack, "results")
         search_box.append(self.search_stack)
         self.on_search_changed(self.search_entry)
         self.content_stack.add_named(search_box, "search_view")
@@ -425,6 +478,9 @@ class LinexinPackageManager(Gtk.Box):
         if self.search_timer:
             GLib.source_remove(self.search_timer)
             self.search_timer = None
+        if self.list_detail_stack.get_visible_child_name() == "detail":
+            self.list_detail_stack.set_transition_type(Gtk.StackTransitionType.SLIDE_RIGHT)
+            self.list_detail_stack.set_visible_child_name("list")
         query = entry.get_text().strip()
         self.search_counter += 1
         current_search_id = self.search_counter
@@ -504,6 +560,19 @@ class LinexinPackageManager(Gtk.Box):
             except Exception as e:
                 print(f"AUR search error: {e}")
         if search_id == self.search_counter:
+            if query:
+                q = query.lower()
+                def sort_key(r):
+                    name = r['name'].lower()
+                    if name == q:
+                        return (0, name)
+                    elif name.startswith(q):
+                        return (1, name)
+                    elif q in name:
+                        return (2, name)
+                    else:
+                        return (3, name)
+                results.sort(key=sort_key)
             self.all_search_results = results
             GLib.idle_add(self.update_results_initial)
     def update_results_initial(self):
@@ -532,6 +601,676 @@ class LinexinPackageManager(Gtk.Box):
             ))
         self.store.splice(self.store.get_n_items(), 0, new_items)
         self.displayed_count = end_idx
+    def _build_detail_page(self):
+        detail_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=0)
+        detail_box.set_vexpand(True)
+
+        # ── Toolbar: back button + package name ──
+        toolbar = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=6)
+        toolbar.set_margin_top(6)
+        toolbar.set_margin_start(6)
+        toolbar.set_margin_end(6)
+        toolbar.set_margin_bottom(6)
+        back_btn = Gtk.Button()
+        back_btn.set_icon_name("go-previous-symbolic")
+        back_btn.add_css_class("flat")
+        back_btn.add_css_class("circular")
+        back_btn.set_tooltip_text(_("Back"))
+        back_btn.connect("clicked", self.on_detail_back_clicked)
+        toolbar.append(back_btn)
+        self.detail_header_title = Gtk.Label()
+        self.detail_header_title.add_css_class("title-4")
+        self.detail_header_title.set_ellipsize(Pango.EllipsizeMode.END)
+        self.detail_header_title.set_hexpand(True)
+        self.detail_header_title.set_halign(Gtk.Align.START)
+        toolbar.append(self.detail_header_title)
+        detail_box.append(toolbar)
+        detail_box.append(Gtk.Separator(orientation=Gtk.Orientation.HORIZONTAL))
+
+        scrolled = Gtk.ScrolledWindow()
+        # ── App header (fixed, not scrolled) ──
+        app_header = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=20)
+        app_header.set_valign(Gtk.Align.START)
+        app_header.set_margin_top(24)
+        app_header.set_margin_bottom(16)
+        app_header.set_margin_start(24)
+        app_header.set_margin_end(24)
+
+        self.detail_icon = Gtk.Image()
+        self.detail_icon.set_pixel_size(96)
+        self.detail_icon.set_valign(Gtk.Align.START)
+        app_header.append(self.detail_icon)
+
+        meta_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=4)
+        meta_box.set_valign(Gtk.Align.CENTER)
+        meta_box.set_hexpand(True)
+
+        self.detail_name_label = Gtk.Label()
+        self.detail_name_label.add_css_class("title-1")
+        self.detail_name_label.set_halign(Gtk.Align.START)
+        self.detail_name_label.set_wrap(True)
+        meta_box.append(self.detail_name_label)
+
+        self.detail_version_label = Gtk.Label()
+        self.detail_version_label.add_css_class("dim-label")
+        self.detail_version_label.set_halign(Gtk.Align.START)
+        meta_box.append(self.detail_version_label)
+
+        self.detail_status_label = Gtk.Label()
+        self.detail_status_label.set_halign(Gtk.Align.START)
+        meta_box.append(self.detail_status_label)
+
+        self.detail_aur_badge = Gtk.Label()
+        self.detail_aur_badge.set_markup("<span background='#a40000' color='white' size='small'><b> AUR </b></span>")
+        self.detail_aur_badge.set_halign(Gtk.Align.START)
+        meta_box.append(self.detail_aur_badge)
+
+        app_header.append(meta_box)
+
+        btn_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=6)
+        btn_box.set_valign(Gtk.Align.CENTER)
+
+        self.detail_btn_size_group = Gtk.SizeGroup(mode=Gtk.SizeGroupMode.HORIZONTAL)
+
+        self.detail_version_btn = Gtk.Button()
+        self.detail_version_btn.set_label(_("Change Version"))
+        self.detail_version_btn.add_css_class("pill")
+        self.detail_version_btn.connect("clicked", self.on_detail_change_version_clicked)
+        self.detail_btn_size_group.add_widget(self.detail_version_btn)
+        btn_box.append(self.detail_version_btn)
+
+        self.detail_install_row = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=6)
+
+        self.detail_install_older_btn = Gtk.Button()
+        self.detail_install_older_btn.set_label(_("Install Older Version"))
+        self.detail_install_older_btn.add_css_class("pill")
+        self.detail_install_older_btn.connect("clicked", self.on_detail_change_version_clicked)
+        self.detail_install_row.append(self.detail_install_older_btn)
+
+        self.detail_action_btn = Gtk.Button()
+        self.detail_action_btn.add_css_class("pill")
+        self.detail_action_btn.connect("clicked", self.on_detail_action_clicked)
+        self.detail_btn_size_group.add_widget(self.detail_action_btn)
+        self.detail_install_row.append(self.detail_action_btn)
+
+        btn_box.append(self.detail_install_row)
+
+        app_header.append(btn_box)
+
+        detail_box.append(app_header)
+        detail_box.append(Gtk.Separator(orientation=Gtk.Orientation.HORIZONTAL))
+
+        # ── Short pacman description ──
+        self.detail_desc_label = Gtk.Label()
+        self.detail_desc_label.set_wrap(True)
+        self.detail_desc_label.set_halign(Gtk.Align.START)
+        self.detail_desc_label.add_css_class("body")
+        self.detail_desc_label.set_margin_top(12)
+        self.detail_desc_label.set_margin_bottom(12)
+        self.detail_desc_label.set_margin_start(24)
+        self.detail_desc_label.set_margin_end(24)
+        detail_box.append(self.detail_desc_label)
+        detail_box.append(Gtk.Separator(orientation=Gtk.Orientation.HORIZONTAL))
+
+        # ── Wiki section header ──
+        self.detail_wiki_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=0)
+        self.detail_wiki_box.set_vexpand(True)
+        self.detail_wiki_url = None
+        self.detail_wiki_btn = Gtk.Button()
+        self.detail_wiki_btn.add_css_class("flat")
+        self.detail_wiki_btn.set_margin_top(4)
+        self.detail_wiki_btn.set_margin_bottom(4)
+        self.detail_wiki_btn.set_margin_start(18)
+        self.detail_wiki_btn.set_margin_end(18)
+        wiki_btn_content = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=6)
+        wiki_icon = Gtk.Image.new_from_icon_name("help-browser-symbolic")
+        wiki_icon.set_pixel_size(16)
+        wiki_btn_content.append(wiki_icon)
+        wiki_title_lbl = Gtk.Label(label=_("Arch Wiki"))
+        wiki_title_lbl.add_css_class("heading")
+        wiki_title_lbl.set_hexpand(True)
+        wiki_title_lbl.set_halign(Gtk.Align.START)
+        wiki_btn_content.append(wiki_title_lbl)
+        wiki_open_icon = Gtk.Image.new_from_icon_name("web-browser-symbolic")
+        wiki_open_icon.set_pixel_size(14)
+        wiki_btn_content.append(wiki_open_icon)
+        self.detail_wiki_spinner = Gtk.Spinner()
+        self.detail_wiki_spinner.set_size_request(16, 16)
+        wiki_btn_content.append(self.detail_wiki_spinner)
+        self.detail_wiki_btn.set_child(wiki_btn_content)
+        self.detail_wiki_btn.connect("clicked", self._on_wiki_open_clicked)
+        self.detail_wiki_box.append(self.detail_wiki_btn)
+
+        if WEBKIT_AVAILABLE:
+            settings = WebKit.Settings()
+            settings.set_enable_javascript(False)
+            settings.set_enable_media(False)
+            ucm = WebKit.UserContentManager()
+            ucm.add_style_sheet(
+                WebKit.UserStyleSheet(
+                    self._WIKI_CSS,
+                    WebKit.UserContentInjectedFrames.ALL_FRAMES,
+                    WebKit.UserStyleLevel.USER,
+                    None, None
+                )
+            )
+            self.detail_webview = WebKit.WebView(
+                settings=settings,
+                user_content_manager=ucm
+            )
+            self.detail_webview.set_background_color(Gdk.RGBA(0, 0, 0, 0))
+            self.detail_webview.set_vexpand(True)
+            self.detail_wiki_box.append(self.detail_webview)
+        else:
+            self.detail_wiki_label = Gtk.Label()
+            self.detail_wiki_label.set_wrap(True)
+            self.detail_wiki_label.set_halign(Gtk.Align.START)
+            self.detail_wiki_label.add_css_class("body")
+            self.detail_wiki_label.set_margin_top(12)
+            self.detail_wiki_label.set_margin_start(24)
+            self.detail_wiki_label.set_margin_end(24)
+            self.detail_wiki_box.append(self.detail_wiki_label)
+
+        detail_box.append(self.detail_wiki_box)
+        self.list_detail_stack.add_named(detail_box, "detail")
+    def show_package_detail(self, pkg):
+        self.detail_current_pkg = pkg
+        self.detail_header_title.set_label(pkg.name)
+        self.detail_icon.set_from_icon_name(self.resolve_icon_name(pkg.name))
+        self.detail_name_label.set_label(pkg.name)
+        self.detail_version_label.set_label(f"{pkg.version}  ·  {pkg.repo}")
+        self.detail_aur_badge.set_visible(pkg.is_aur)
+        self.detail_version_btn.set_visible(pkg.installed and not pkg.is_aur)
+        self.detail_install_older_btn.set_visible(not pkg.installed and not pkg.is_aur)
+        if pkg.installed:
+            self.detail_status_label.set_markup(f"<span foreground='#33d17a'>● {_('Installed')}</span>")
+            self.detail_action_btn.set_label(_("Remove"))
+            self.detail_action_btn.remove_css_class("suggested-action")
+            self.detail_action_btn.add_css_class("destructive-action")
+        else:
+            self.detail_status_label.set_markup(f"<span foreground='gray'>○ {_('Not installed')}</span>")
+            self.detail_action_btn.set_label(_("Install"))
+            self.detail_action_btn.remove_css_class("destructive-action")
+            self.detail_action_btn.add_css_class("suggested-action")
+        self.detail_desc_label.set_label(pkg.desc or _("No description available."))
+        self._wiki_fetch_id = getattr(self, '_wiki_fetch_id', 0) + 1
+        self.detail_wiki_box.set_visible(True)
+        self.detail_wiki_spinner.start()
+        if WEBKIT_AVAILABLE:
+            self.detail_webview.load_uri("about:blank")
+        threading.Thread(
+            target=self._fetch_wiki_description,
+            args=(pkg.name, self._wiki_fetch_id),
+            daemon=True
+        ).start()
+        self.list_detail_stack.set_transition_type(Gtk.StackTransitionType.SLIDE_LEFT)
+        self.list_detail_stack.set_visible_child_name("detail")
+    def _fetch_wiki_description(self, pkg_name, fetch_id):
+        candidates = [pkg_name]
+        titled = pkg_name.replace('-', ' ').title().replace(' ', '-')
+        if titled not in candidates:
+            candidates.append(titled)
+        plain_titled = pkg_name.replace('-', ' ').title()
+        if plain_titled not in candidates:
+            candidates.append(plain_titled)
+        for title in candidates:
+            try:
+                api_url = (
+                    "https://wiki.archlinux.org/api.php?"
+                    "action=parse&prop=text&format=json&redirects=1"
+                    f"&page={urllib.parse.quote(title)}"
+                )
+                with urllib.request.urlopen(api_url, timeout=10) as resp:
+                    data = json.loads(resp.read().decode())
+                if "error" in data:
+                    continue
+                body_html = data.get("parse", {}).get("text", {}).get("*", "")
+                page_title = data.get("parse", {}).get("title", title)
+                if body_html:
+                    wiki_url = f"https://wiki.archlinux.org/title/{urllib.parse.quote(page_title)}"
+                    GLib.idle_add(self._on_wiki_fetched, body_html, fetch_id, wiki_url)
+                    return
+            except Exception:
+                pass
+        # Fallback: try OpenSearch with progressively shorter prefixes of the
+        # package name (e.g. nvidia-open → nvidia-open, then nvidia) so that
+        # packages like nvidia-open resolve to the "NVIDIA" wiki page.
+        parts = pkg_name.split('-')
+        seen_search_terms = set()
+        for i in range(len(parts), 0, -1):
+            term = '-'.join(parts[:i])
+            if term in seen_search_terms:
+                continue
+            seen_search_terms.add(term)
+            try:
+                search_url = (
+                    "https://wiki.archlinux.org/api.php?"
+                    "action=opensearch&format=json&redirects=resolve&limit=1"
+                    f"&search={urllib.parse.quote(term)}"
+                )
+                with urllib.request.urlopen(search_url, timeout=10) as resp:
+                    results = json.loads(resp.read().decode())
+                # results = [query, [titles], [descriptions], [urls]]
+                titles = results[1] if len(results) > 1 else []
+                if not titles:
+                    continue
+                top_title = titles[0]
+                api_url = (
+                    "https://wiki.archlinux.org/api.php?"
+                    "action=parse&prop=text&format=json&redirects=1"
+                    f"&page={urllib.parse.quote(top_title)}"
+                )
+                with urllib.request.urlopen(api_url, timeout=10) as resp:
+                    data = json.loads(resp.read().decode())
+                if "error" in data:
+                    continue
+                body_html = data.get("parse", {}).get("text", {}).get("*", "")
+                page_title = data.get("parse", {}).get("title", top_title)
+                if body_html:
+                    wiki_url = f"https://wiki.archlinux.org/title/{urllib.parse.quote(page_title)}"
+                    GLib.idle_add(self._on_wiki_fetched, body_html, fetch_id, wiki_url)
+                    return
+            except Exception:
+                pass
+        GLib.idle_add(self._on_wiki_fetched, None, fetch_id, None)
+    _WIKI_CSS = """
+        html, body {
+            background: transparent !important;
+            font-family: Cantarell, sans-serif !important;
+            margin: 0 !important;
+            padding: 0 16px !important;
+            font-size: 15px !important;
+            line-height: 1.6 !important;
+        }
+        /* Hide related-articles box and TOC */
+        .archwiki-template-meta-related-articles,
+        .toc, #toc, .mw-editsection { display: none !important; }
+
+        a { text-decoration: none !important; }
+        a:hover { text-decoration: underline !important; }
+
+        h1, h2, h3, h4, h5 { margin-top: 1.2em !important; }
+        h2 { padding-bottom: 4px !important; }
+
+        code { padding: 1px 5px !important; }
+        pre, code, kbd, .mw-highlight { border-radius: 6px !important; }
+        pre, .mw-highlight {
+            padding: 12px 16px !important;
+            overflow-x: auto !important;
+            line-height: 1.6 !important;
+        }
+        pre code { background: transparent !important; border: none !important;
+                   padding: 0 !important; }
+
+        table.wikitable { border-collapse: collapse !important; }
+        table.wikitable td, table.wikitable th { padding: 6px 10px !important; }
+
+        .archwiki-template-box,
+        .archwiki-template-box-note,
+        .archwiki-template-box-warning,
+        .archwiki-template-box-tip {
+            border-radius: 4px !important;
+            padding: 10px 14px !important;
+            margin: 12px 0 !important;
+        }
+
+        img { max-width: 100% !important; }
+        dl { margin-left: 1em !important; }
+        dt { font-weight: bold !important; }
+
+        /* ---- Dark mode ---- */
+        @media (prefers-color-scheme: dark) {
+            html, body { color: #e0e0e0 !important; }
+            a { color: #78aeed !important; }
+            a:visited { color: #a78aee !important; }
+            h1, h2, h3, h4, h5 { color: #ffffff !important; }
+            h2 { border-bottom: 1px solid rgba(255,255,255,0.12) !important; }
+            dt { color: #ffffff !important; }
+
+            pre, code, kbd, .mw-highlight {
+                background: rgba(255,255,255,0.07) !important;
+                color: #d8d8d8 !important;
+                border: 1px solid rgba(255,255,255,0.1) !important;
+            }
+
+            table.wikitable { border: 1px solid rgba(255,255,255,0.15) !important; }
+            table.wikitable th {
+                background: rgba(255,255,255,0.08) !important;
+                color: #ffffff !important;
+            }
+            table.wikitable td, table.wikitable th {
+                border: 1px solid rgba(255,255,255,0.15) !important;
+                color: #e0e0e0 !important;
+            }
+
+            .archwiki-template-box,
+            .archwiki-template-box-note,
+            .archwiki-template-box-warning,
+            .archwiki-template-box-tip {
+                background: rgba(255,255,255,0.05) !important;
+                border-left: 3px solid rgba(255,255,255,0.3) !important;
+                color: #e0e0e0 !important;
+            }
+            .archwiki-template-box-warning {
+                border-left-color: rgba(220,80,40,0.8) !important;
+                background: rgba(220,60,30,0.08) !important;
+            }
+            .archwiki-template-box-note {
+                border-left-color: rgba(80,150,230,0.8) !important;
+                background: rgba(60,120,230,0.08) !important;
+            }
+            .archwiki-template-box-tip {
+                border-left-color: rgba(60,190,80,0.8) !important;
+                background: rgba(40,170,60,0.08) !important;
+            }
+        }
+
+        /* ---- Light mode ---- */
+        @media (prefers-color-scheme: light) {
+            html, body { color: #1a1a1a !important; }
+            a { color: #1a73e8 !important; }
+            a:visited { color: #6a1b9a !important; }
+            h1, h2, h3, h4, h5 { color: #1a1a1a !important; }
+            h2 { border-bottom: 1px solid rgba(0,0,0,0.12) !important; }
+            dt { color: #1a1a1a !important; }
+
+            pre, code, kbd, .mw-highlight {
+                background: rgba(0,0,0,0.05) !important;
+                color: #2a2a2a !important;
+                border: 1px solid rgba(0,0,0,0.1) !important;
+            }
+
+            table.wikitable { border: 1px solid rgba(0,0,0,0.15) !important; }
+            table.wikitable th {
+                background: rgba(0,0,0,0.06) !important;
+                color: #1a1a1a !important;
+            }
+            table.wikitable td, table.wikitable th {
+                border: 1px solid rgba(0,0,0,0.15) !important;
+                color: #1a1a1a !important;
+            }
+
+            .archwiki-template-box,
+            .archwiki-template-box-note,
+            .archwiki-template-box-warning,
+            .archwiki-template-box-tip {
+                background: rgba(0,0,0,0.04) !important;
+                border-left: 3px solid rgba(0,0,0,0.2) !important;
+                color: #1a1a1a !important;
+            }
+            .archwiki-template-box-warning {
+                border-left-color: rgba(200,50,20,0.7) !important;
+                background: rgba(220,60,30,0.06) !important;
+            }
+            .archwiki-template-box-note {
+                border-left-color: rgba(30,100,210,0.7) !important;
+                background: rgba(30,100,210,0.06) !important;
+            }
+            .archwiki-template-box-tip {
+                border-left-color: rgba(30,150,50,0.7) !important;
+                background: rgba(30,150,50,0.06) !important;
+            }
+        }
+    """
+    def _on_wiki_fetched(self, html_or_none, fetch_id, wiki_url):
+        if fetch_id != getattr(self, '_wiki_fetch_id', None):
+            return
+        self.detail_wiki_spinner.stop()
+        self.detail_wiki_url = wiki_url
+        if not html_or_none:
+            self.detail_wiki_box.set_visible(False)
+            return
+        self.detail_wiki_box.set_visible(True)
+        if WEBKIT_AVAILABLE:
+            full_html = (
+                "<!DOCTYPE html><html><head>"
+                "<meta charset='utf-8'>"
+                f"<style>{self._WIKI_CSS}</style>"
+                "</head><body>"
+                f"{html_or_none}"
+                "</body></html>"
+            )
+            self.detail_webview.load_html(full_html, "https://wiki.archlinux.org/")
+        else:
+            clean = re.sub(r'<[^>]+>', '', html_or_none)
+            clean = html_module.unescape(clean)
+            clean = re.sub(r'\s+', ' ', clean).strip()
+            self.detail_wiki_label.set_label(clean[:2000] if len(clean) > 2000 else clean)
+    def _on_wiki_open_clicked(self, btn):
+        if self.detail_wiki_url:
+            Gtk.show_uri(self.get_root(), self.detail_wiki_url, Gdk.CURRENT_TIME)
+    def on_detail_back_clicked(self, btn):
+        self.list_detail_stack.set_transition_type(Gtk.StackTransitionType.SLIDE_RIGHT)
+        self.list_detail_stack.set_visible_child_name("list")
+    def on_detail_action_clicked(self, btn):
+        pkg = self.detail_current_pkg
+        pkg_dict = {
+            'name': pkg.name, 'repo': pkg.repo, 'version': pkg.version,
+            'installed': pkg.installed, 'desc': pkg.desc, 'is_aur': pkg.is_aur
+        }
+        if pkg.installed:
+            self.initiate_remove(pkg.name)
+        else:
+            self.initiate_install(pkg_dict)
+    def on_detail_change_version_clicked(self, btn):
+        pkg = self.detail_current_pkg
+        btn.set_sensitive(False)
+        threading.Thread(
+            target=self._fetch_available_versions,
+            args=(pkg.name,),
+            daemon=True
+        ).start()
+    def _fetch_available_versions(self, pkg_name):
+        versions = []
+        installed_ver = None
+        # Get currently installed version
+        try:
+            result = subprocess.run(
+                ["pacman", "-Q", pkg_name],
+                capture_output=True, text=True,
+                env={**os.environ, 'LC_ALL': 'C'}
+            )
+            if result.returncode == 0:
+                parts = result.stdout.strip().split()
+                if len(parts) >= 2:
+                    installed_ver = parts[1]
+        except Exception:
+            pass
+        # Get current repo version
+        try:
+            result = subprocess.run(
+                ["pacman", "-Sl"],
+                capture_output=True, text=True,
+                env={**os.environ, 'LC_ALL': 'C'}
+            )
+            if result.returncode == 0:
+                for line in result.stdout.strip().split('\n'):
+                    parts = line.split()
+                    if len(parts) >= 3 and parts[1] == pkg_name:
+                        repo = parts[0]
+                        ver = parts[2]
+                        is_current = (ver == installed_ver)
+                        versions.append({"source": repo, "ver": ver, "current": is_current, "url": None})
+        except Exception:
+            pass
+        # Check local cache
+        cache_dir = "/var/cache/pacman/pkg"
+        seen_versions = {v["ver"] for v in versions}
+        if os.path.isdir(cache_dir):
+            try:
+                pattern = re.compile(
+                    rf'^{re.escape(pkg_name)}-(\d.+?)-(x86_64|any)\.pkg\.tar\.(zst|xz|gz)$'
+                )
+                for fname in os.listdir(cache_dir):
+                    m = pattern.match(fname)
+                    if m:
+                        ver = m.group(1)
+                        if ver not in seen_versions:
+                            is_current = (ver == installed_ver)
+                            versions.append({"source": _("cache"), "ver": ver, "current": is_current,
+                                             "url": os.path.join(cache_dir, fname)})
+                            seen_versions.add(ver)
+            except Exception:
+                pass
+        # Fetch from Arch Linux Archive
+        try:
+            first_letter = pkg_name[0].lower()
+            archive_url = f"https://archive.archlinux.org/packages/{first_letter}/{pkg_name}/"
+            with urllib.request.urlopen(archive_url, timeout=10) as resp:
+                html = resp.read().decode()
+            pkg_pattern = re.compile(
+                rf'href="({re.escape(pkg_name)}-([^"]+?)-(x86_64|any)\.pkg\.tar\.[a-z]+)"'
+            )
+            for match in pkg_pattern.finditer(html):
+                fname = urllib.parse.unquote(match.group(1))
+                ver = urllib.parse.unquote(match.group(2))
+                if ver not in seen_versions:
+                    is_current = (ver == installed_ver)
+                    dl_url = archive_url + match.group(1)
+                    versions.append({"source": _("archive"), "ver": ver, "current": is_current,
+                                     "url": dl_url})
+                    seen_versions.add(ver)
+        except Exception:
+            pass
+        # Sort by version descending (newest first) using pacman's vercmp if available
+        try:
+            def ver_sort_key(v):
+                result = subprocess.run(
+                    ["vercmp", v["ver"], "0"],
+                    capture_output=True, text=True
+                )
+                return v["ver"]
+            versions.sort(key=lambda v: v["ver"], reverse=True)
+        except Exception:
+            pass
+        GLib.idle_add(self._show_version_dialog, pkg_name, versions)
+    def _show_version_dialog(self, pkg_name, versions):
+        root = self.get_root() or self.window
+        if not versions:
+            dialog = Adw.MessageDialog(
+                heading=_("No Versions Found"),
+                body=_("No alternative versions found for {}.").format(pkg_name),
+                transient_for=root
+            )
+            dialog.add_response("ok", _("OK"))
+            translate_dialog(dialog)
+            dialog.present()
+            return
+        dialog = Adw.MessageDialog(
+            heading=_("Change Version"),
+            body=_("Select a version for {}:").format(pkg_name),
+            transient_for=root
+        )
+        dialog.add_response("cancel", _("Cancel"))
+        listbox = Gtk.ListBox()
+        listbox.set_selection_mode(Gtk.SelectionMode.SINGLE)
+        listbox.add_css_class("boxed-list")
+        for v in versions:
+            row = Adw.ActionRow()
+            row.set_title(v["ver"])
+            row.set_subtitle(v["source"])
+            if v["current"]:
+                badge = Gtk.Label(label=_("Current"))
+                badge.add_css_class("dim-label")
+                badge.set_valign(Gtk.Align.CENTER)
+                row.add_suffix(badge)
+            row._version_info = v
+            listbox.append(row)
+        scrolled = Gtk.ScrolledWindow()
+        scrolled.set_min_content_height(150)
+        scrolled.set_max_content_height(300)
+        scrolled.set_policy(Gtk.PolicyType.NEVER, Gtk.PolicyType.AUTOMATIC)
+        scrolled.set_child(listbox)
+        dialog.set_extra_child(scrolled)
+        dialog.add_response("install", _("Install Selected"))
+        dialog.set_response_appearance("install", Adw.ResponseAppearance.SUGGESTED)
+        def on_response(dlg, response):
+            if response == "install":
+                selected_row = listbox.get_selected_row()
+                if selected_row:
+                    v = selected_row._version_info
+                    if v["url"] and v["url"].startswith("http"):
+                        # Archive URL - install via URL
+                        target = v["url"]
+                    elif v["url"]:
+                        # Local cache file path
+                        target = v["url"]
+                    else:
+                        # Repo version
+                        target = f"{v['source']}/{pkg_name}"
+                    self.action_type = "install"
+                    self.prompt_for_password(lambda: self._install_specific_version(pkg_name, target))
+            dlg.close()
+        dialog.connect("response", on_response)
+        translate_dialog(dialog)
+        self.detail_version_btn.set_sensitive(True)
+        self.detail_install_older_btn.set_sensitive(True)
+        dialog.present()
+    def _install_specific_version(self, pkg_name, target):
+        self.content_stack.set_visible_child_name("progress_view")
+        self.output_buffer.set_text("")
+        self.btn_back.set_sensitive(False)
+        self.process_in_progress = True
+        self.current_package_name = pkg_name
+        self.progress_bar.set_visible(True)
+        self.revealer_details.set_reveal_child(False)
+        self.btn_details.set_label(_("Show Details"))
+        self.btn_cancel.set_visible(True)
+        self.progress_title.set_text(_("Installing {}...").format(pkg_name))
+        self.lbl_progress_status.set_text(_("Changing version..."))
+        self.pulse_timer_id = GLib.timeout_add(100, self.pulse_progress)
+        if target.startswith("http"):
+            # Download from ALA to temp dir first, then install locally
+            # to avoid PGP signature issues with expired keys
+            threading.Thread(target=self._download_and_install, args=(pkg_name, target), daemon=True).start()
+        else:
+            sudo_wrap = sudo_manager.wrapper_path
+            if target.startswith("/"):
+                cmd = [sudo_wrap, "pacman", "-U", "--noconfirm", target]
+            else:
+                cmd = [sudo_wrap, "pacman", "-S", "--noconfirm", target]
+            threading.Thread(target=self.execute_shell, args=(cmd, pkg_name), daemon=True).start()
+
+    def _download_and_install(self, pkg_name, url):
+        import tempfile
+        tmp_dir = tempfile.mkdtemp(prefix="linpama_")
+        filename = urllib.parse.unquote(url.rsplit("/", 1)[-1])
+        local_path = os.path.join(tmp_dir, filename)
+        try:
+            GLib.idle_add(self.lbl_progress_status.set_text, _("Downloading package..."))
+            urllib.request.urlretrieve(url, local_path)
+        except Exception as e:
+            GLib.idle_add(self._download_failed, pkg_name, str(e), tmp_dir)
+            return
+        sudo_wrap = sudo_manager.wrapper_path
+        cmd = [sudo_wrap, "pacman", "-U", "--noconfirm", local_path]
+        self.execute_shell(cmd, pkg_name)
+        # Cleanup temp dir
+        try:
+            import shutil
+            shutil.rmtree(tmp_dir, ignore_errors=True)
+        except Exception:
+            pass
+
+    def _download_failed(self, pkg_name, error, tmp_dir):
+        self.process_in_progress = False
+        self.btn_back.set_sensitive(True)
+        self.btn_cancel.set_visible(False)
+        self.progress_bar.set_visible(False)
+        if self.pulse_timer_id:
+            GLib.source_remove(self.pulse_timer_id)
+            self.pulse_timer_id = None
+        self.progress_title.set_text(_("Download Failed"))
+        self.lbl_progress_status.set_text(error)
+        try:
+            import shutil
+            shutil.rmtree(tmp_dir, ignore_errors=True)
+        except Exception:
+            pass
+    def on_listview_item_activate(self, listview, position):
+        pkg = self.store.get_item(position)
+        if pkg:
+            self.show_package_detail(pkg)
     def setup_list_item(self, factory, list_item):
         row = Adw.ActionRow()
         icon = Gtk.Image()
@@ -607,7 +1346,6 @@ class LinexinPackageManager(Gtk.Box):
         self.action_type = "refresh"
         self.prompt_for_password(lambda: self.run_repo_update())
     def run_repo_update(self):
-        self.refresh_btn.set_sensitive(False)
         threading.Thread(target=self._update_repo_thread, daemon=True).start()
     def _update_repo_thread(self):
         self.repo_update_error = None
@@ -637,7 +1375,6 @@ class LinexinPackageManager(Gtk.Box):
         if sudo_manager:
             sudo_manager.forget_password()
         self.user_password = None
-        self.refresh_btn.set_sensitive(True)
         if self.repo_update_error:
             dialog = Adw.MessageDialog(
                 heading=_("Update Failed"),
@@ -647,6 +1384,209 @@ class LinexinPackageManager(Gtk.Box):
             dialog.add_response("ok", _("OK"))
             translate_dialog(dialog)
             dialog.present()
+    def on_clear_cache_clicked(self, btn):
+        self.action_type = "clear_cache"
+        self.prompt_for_password(lambda: self.run_clear_cache())
+
+    def run_clear_cache(self):
+        self.content_stack.set_visible_child_name("progress_view")
+        self.output_buffer.set_text("")
+        self.btn_back.set_sensitive(False)
+        self.process_in_progress = True
+        self.current_package_name = _("cache")
+        self.progress_bar.set_visible(True)
+        self.revealer_details.set_reveal_child(False)
+        self.btn_details.set_label(_("Show Details"))
+        self.btn_cancel.set_visible(True)
+        self.progress_title.set_text(_("Clearing Package Cache..."))
+        self.lbl_progress_status.set_text(_("Removing cached packages..."))
+        self.pulse_timer_id = GLib.timeout_add(100, self.pulse_progress)
+        sudo_wrap = sudo_manager.wrapper_path
+        cmds = [[sudo_wrap, "pacman", "-Scc", "--noconfirm"]]
+        paru_cmds = []
+        if shutil.which("paru"):
+            paru_cmds.append(["paru", "-Scc", "--noconfirm"])
+        threading.Thread(target=self._run_sequential_cmds, args=(cmds, _("cache"), paru_cmds), daemon=True).start()
+
+    def on_remove_orphans_clicked(self, btn):
+        self.action_type = "remove_orphans"
+        self.prompt_for_password(lambda: self.run_remove_orphans())
+
+    def run_remove_orphans(self):
+        threading.Thread(target=self._find_orphans_thread, daemon=True).start()
+
+    def _find_orphans_thread(self):
+        try:
+            result = subprocess.run(["pacman", "-Qdtq"], capture_output=True, text=True)
+            orphans = result.stdout.strip()
+            GLib.idle_add(self._show_orphans_confirmation, orphans)
+        except Exception as e:
+            GLib.idle_add(self._show_orphans_confirmation, "")
+
+    def _show_orphans_confirmation(self, orphans):
+        root = self.get_root() or self.window
+        if not orphans:
+            dialog = Adw.MessageDialog(
+                heading=_("No Orphans Found"),
+                body=_("There are no orphan packages to remove."),
+                transient_for=root
+            )
+            dialog.add_response("ok", _("OK"))
+            translate_dialog(dialog)
+            dialog.present()
+            return
+        orphan_list = orphans.split("\n")
+        dialog = Adw.MessageDialog(
+            heading=_("Remove Orphan Packages"),
+            body=_("The following {} packages will be removed:").format(len(orphan_list)),
+            transient_for=root
+        )
+        dialog.add_response("cancel", _("Cancel"))
+        dialog.add_response("remove", _("Remove All"))
+        dialog.set_response_appearance("remove", Adw.ResponseAppearance.DESTRUCTIVE)
+        scrolled = Gtk.ScrolledWindow()
+        scrolled.set_min_content_height(150)
+        scrolled.set_max_content_height(300)
+        scrolled.set_policy(Gtk.PolicyType.NEVER, Gtk.PolicyType.AUTOMATIC)
+        pkg_list_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=4)
+        pkg_list_box.set_margin_start(8)
+        pkg_list_box.set_margin_end(8)
+        for pkg in orphan_list:
+            lbl = Gtk.Label(label=pkg)
+            lbl.set_halign(Gtk.Align.START)
+            lbl.add_css_class("monospace")
+            pkg_list_box.append(lbl)
+        scrolled.set_child(pkg_list_box)
+        dialog.set_extra_child(scrolled)
+        def on_response(dialog, response):
+            if response == "remove":
+                self._start_orphan_removal(orphan_list)
+            dialog.close()
+        dialog.connect("response", on_response)
+        translate_dialog(dialog)
+        dialog.present()
+
+    def _start_orphan_removal(self, orphan_list):
+        self.content_stack.set_visible_child_name("progress_view")
+        self.output_buffer.set_text("")
+        self.btn_back.set_sensitive(False)
+        self.process_in_progress = True
+        self.current_package_name = _("orphans")
+        self.progress_bar.set_visible(True)
+        self.revealer_details.set_reveal_child(False)
+        self.btn_details.set_label(_("Show Details"))
+        self.btn_cancel.set_visible(True)
+        self.progress_title.set_text(_("Removing Orphan Packages..."))
+        self.lbl_progress_status.set_text(_("Removing orphans..."))
+        self.pulse_timer_id = GLib.timeout_add(100, self.pulse_progress)
+        threading.Thread(target=self._remove_orphans_thread, args=(orphan_list,), daemon=True).start()
+
+    def _remove_orphans_thread(self, orphan_list):
+        success = False
+        if sudo_manager:
+            sudo_manager.start_privileged_session()
+        try:
+            env = sudo_manager.get_env()
+            env['LC_ALL'] = 'C'
+            sudo_wrap = sudo_manager.wrapper_path
+            cmd = [sudo_wrap, "pacman", "-Rns", "--noconfirm"] + orphan_list
+            self.current_process = subprocess.Popen(cmd, stdout=subprocess.PIPE,
+                                                    stderr=subprocess.STDOUT, text=True, env=env)
+            for line in iter(self.current_process.stdout.readline, ''):
+                if line:
+                    GLib.idle_add(self.append_log, line)
+            self.current_process.stdout.close()
+            rc = self.current_process.wait()
+            success = (rc == 0)
+        except Exception as e:
+            GLib.idle_add(self.append_log, f"\nError: {e}")
+            success = False
+        GLib.idle_add(self.on_process_finished, success, _("orphans"))
+
+    def on_remove_db_lock_clicked(self, btn):
+        self.action_type = "remove_db_lock"
+        self.prompt_for_password(lambda: self.run_remove_db_lock())
+
+    def run_remove_db_lock(self):
+        self.content_stack.set_visible_child_name("progress_view")
+        self.output_buffer.set_text("")
+        self.btn_back.set_sensitive(False)
+        self.process_in_progress = True
+        self.current_package_name = _("db lock")
+        self.progress_bar.set_visible(True)
+        self.revealer_details.set_reveal_child(False)
+        self.btn_details.set_label(_("Show Details"))
+        self.btn_cancel.set_visible(False)
+        self.progress_title.set_text(_("Removing Database Lock..."))
+        self.lbl_progress_status.set_text(_("Removing /var/lib/pacman/db.lck..."))
+        self.pulse_timer_id = GLib.timeout_add(100, self.pulse_progress)
+        threading.Thread(target=self._remove_db_lock_thread, daemon=True).start()
+
+    def _remove_db_lock_thread(self):
+        success = False
+        if sudo_manager:
+            sudo_manager.start_privileged_session()
+        try:
+            sudo_wrap = sudo_manager.wrapper_path
+            env = sudo_manager.get_env()
+            env['LC_ALL'] = 'C'
+            lock_path = "/var/lib/pacman/db.lck"
+            if not os.path.exists(lock_path):
+                GLib.idle_add(self.append_log, _("No database lock file found. Nothing to do.\n"))
+                success = True
+            else:
+                proc = subprocess.run([sudo_wrap, "rm", "-f", lock_path],
+                                      capture_output=True, text=True, env=env)
+                if proc.returncode == 0:
+                    GLib.idle_add(self.append_log, _("Database lock file removed successfully.\n"))
+                    success = True
+                else:
+                    GLib.idle_add(self.append_log, proc.stderr)
+                    success = False
+        except Exception as e:
+            GLib.idle_add(self.append_log, f"\nError: {e}")
+            success = False
+        GLib.idle_add(self.on_process_finished, success, _("db lock"))
+
+    def _run_sequential_cmds(self, cmds, label, user_cmds=None):
+        success = True
+        if sudo_manager:
+            sudo_manager.start_privileged_session()
+        try:
+            env = sudo_manager.get_env()
+            env['LC_ALL'] = 'C'
+            for cmd in cmds:
+                self.current_process = subprocess.Popen(cmd, stdout=subprocess.PIPE,
+                                                        stderr=subprocess.STDOUT, text=True, env=env)
+                for line in iter(self.current_process.stdout.readline, ''):
+                    if line:
+                        GLib.idle_add(self.append_log, line)
+                self.current_process.stdout.close()
+                rc = self.current_process.wait()
+                if rc != 0:
+                    success = False
+        except Exception as e:
+            GLib.idle_add(self.append_log, f"\nError: {e}")
+            success = False
+        if user_cmds:
+            try:
+                user_env = os.environ.copy()
+                user_env['LC_ALL'] = 'C'
+                for cmd in user_cmds:
+                    self.current_process = subprocess.Popen(cmd, stdout=subprocess.PIPE,
+                                                            stderr=subprocess.STDOUT, text=True, env=user_env)
+                    for line in iter(self.current_process.stdout.readline, ''):
+                        if line:
+                            GLib.idle_add(self.append_log, line)
+                    self.current_process.stdout.close()
+                    rc = self.current_process.wait()
+                    if rc != 0:
+                        success = False
+            except Exception as e:
+                GLib.idle_add(self.append_log, f"\nError: {e}")
+                success = False
+        GLib.idle_add(self.on_process_finished, success, label)
+
     def start_aur_review_process(self, package_name):
         self.aur_temp_dir = tempfile.mkdtemp(prefix=f"{APP_NAME}_aur_")
         self.aur_pkg_name = package_name
@@ -715,8 +1655,15 @@ class LinexinPackageManager(Gtk.Box):
     def prompt_for_password(self, callback_success):
         root = self.get_root() or self.window
         action_label = _("install") if getattr(self, "action_type", "install") == "install" else _("remove")
-        if getattr(self, "action_type", "install") == "refresh":
+        action_type = getattr(self, "action_type", "install")
+        if action_type == "refresh":
              body_text = _("Please enter your password to update repositories.")
+        elif action_type == "clear_cache":
+             body_text = _("Please enter your password to clear the package cache.")
+        elif action_type == "remove_orphans":
+             body_text = _("Please enter your password to remove orphan packages.")
+        elif action_type == "remove_db_lock":
+             body_text = _("Please enter your password to remove the database lock file.")
         else:
              body_text = _("Please enter your password to {} this package.").format(action_label)
         dialog = Adw.MessageDialog(
@@ -822,9 +1769,15 @@ class LinexinPackageManager(Gtk.Box):
                 shutil.rmtree(self.aur_temp_dir)
             except: pass
         if success:
-            self.info_icon.set_from_icon_name("emblem-ok")
+            self.info_icon.set_from_icon_name("object-select-symbolic")
             if self.action_type == "remove":
                  self.info_text.set_text(_("Successfully removed {}").format(pkg_name))
+            elif self.action_type == "clear_cache":
+                 self.info_text.set_text(_("Package cache cleared successfully."))
+            elif self.action_type == "remove_orphans":
+                 self.info_text.set_text(_("Orphan packages removed successfully."))
+            elif self.action_type == "remove_db_lock":
+                 self.info_text.set_text(_("Database lock removed successfully."))
             else:
                  self.info_text.set_text(_("Successfully installed {}").format(pkg_name))
             self.content_stack.set_visible_child_name("info_view")
@@ -844,3 +1797,194 @@ class LinexinPackageManager(Gtk.Box):
         return False
     def on_back_clicked(self, btn):
         self.content_stack.set_visible_child_name("search_view")
+
+    def _on_sidebar_btn_toggled(self, btn):
+        active = btn.get_active()
+        if self.wide_layout_enabled:
+            self.right_revealer.set_reveal_child(active)
+        else:
+            self.compact_panel_revealer.set_reveal_child(active)
+
+    def _on_compact_panel_close(self, btn):
+        self.compact_sidebar_btn.set_active(False)
+
+    def setup_right_pane(self):
+        self.right_pane = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=12)
+        self.right_pane.set_hexpand(False)
+        self.right_pane.set_vexpand(True)
+        self.right_pane.set_valign(Gtk.Align.FILL)
+        self.right_pane.set_margin_end(16)
+        top_actions_group = Adw.PreferencesGroup()
+        top_actions_group.set_title(_("Actions"))
+
+        row_refresh = Adw.ActionRow()
+        row_refresh.set_title(_("Refresh Repositories"))
+        row_refresh.set_subtitle(_("Sync package databases"))
+        row_refresh.add_prefix(Gtk.Image.new_from_icon_name("view-refresh-symbolic"))
+        row_refresh.set_activatable(True)
+        row_refresh.connect("activated", self.on_refresh_repos_clicked)
+        top_actions_group.add(row_refresh)
+
+        self.right_pane.append(top_actions_group)
+
+        right_pane_spacer = Gtk.Box()
+        right_pane_spacer.set_vexpand(True)
+        self.right_pane.append(right_pane_spacer)
+
+        bottom_actions_group = Adw.PreferencesGroup()
+
+        row_cache = Adw.ActionRow()
+        row_cache.set_title(_("Clear Package Cache"))
+        row_cache.set_subtitle(_("Free disk space from cached packages"))
+        row_cache.add_prefix(Gtk.Image.new_from_icon_name("user-trash-symbolic"))
+        row_cache.set_activatable(True)
+        row_cache.connect("activated", self.on_clear_cache_clicked)
+        bottom_actions_group.add(row_cache)
+
+        row_orphans = Adw.ActionRow()
+        row_orphans.set_title(_("Remove Orphans"))
+        row_orphans.set_subtitle(_("Remove unused dependency packages"))
+        row_orphans.add_prefix(Gtk.Image.new_from_icon_name("edit-clear-all-symbolic"))
+        row_orphans.set_activatable(True)
+        row_orphans.connect("activated", self.on_remove_orphans_clicked)
+        bottom_actions_group.add(row_orphans)
+
+        row_db_lock = Adw.ActionRow()
+        row_db_lock.set_title(_("Remove DB Lock"))
+        row_db_lock.set_subtitle(_("Delete /var/lib/pacman/db.lck"))
+        row_db_lock.add_prefix(Gtk.Image.new_from_icon_name("channel-insecure-symbolic"))
+        row_db_lock.set_activatable(True)
+        row_db_lock.connect("activated", self.on_remove_db_lock_clicked)
+        bottom_actions_group.add(row_db_lock)
+
+        self.right_pane.append(bottom_actions_group)
+        # Compact overlay panel (slides from right on top of content)
+        self.compact_panel_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=12)
+        self.compact_panel_box.set_hexpand(False)
+        self.compact_panel_box.set_vexpand(True)
+        self.compact_panel_box.set_valign(Gtk.Align.FILL)
+        self.compact_panel_box.set_halign(Gtk.Align.END)
+        self.compact_panel_box.set_size_request(RIGHT_PANE_MIN_WIDTH, -1)
+        self.compact_panel_box.add_css_class("background")
+        compact_header = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL)
+        compact_header.set_halign(Gtk.Align.END)
+        compact_header.set_margin_top(4)
+        compact_header.set_margin_end(4)
+        compact_close_btn = Gtk.Button.new_from_icon_name("window-close-symbolic")
+        compact_close_btn.add_css_class("flat")
+        compact_close_btn.add_css_class("circular")
+        compact_close_btn.set_tooltip_text(_("Close"))
+        compact_close_btn.connect("clicked", self._on_compact_panel_close)
+        compact_header.append(compact_close_btn)
+        self.compact_panel_box.append(compact_header)
+        compact_center = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=12)
+        compact_center.set_valign(Gtk.Align.FILL)
+        compact_center.set_halign(Gtk.Align.CENTER)
+        compact_center.set_vexpand(True)
+        compact_center.set_margin_start(WIDE_LAYOUT_SIDE_PADDING)
+        compact_center.set_margin_end(WIDE_LAYOUT_SIDE_PADDING)
+        compact_top_actions_group = Adw.PreferencesGroup()
+        compact_top_actions_group.set_title(_("Actions"))
+
+        compact_row_refresh = Adw.ActionRow()
+        compact_row_refresh.set_title(_("Refresh Repositories"))
+        compact_row_refresh.set_subtitle(_("Sync package databases"))
+        compact_row_refresh.add_prefix(Gtk.Image.new_from_icon_name("view-refresh-symbolic"))
+        compact_row_refresh.set_activatable(True)
+        compact_row_refresh.connect("activated", self.on_refresh_repos_clicked)
+        compact_top_actions_group.add(compact_row_refresh)
+
+        compact_center.append(compact_top_actions_group)
+
+        compact_pane_spacer = Gtk.Box()
+        compact_pane_spacer.set_vexpand(True)
+        compact_center.append(compact_pane_spacer)
+
+        compact_bottom_actions_group = Adw.PreferencesGroup()
+
+        compact_row_cache = Adw.ActionRow()
+        compact_row_cache.set_title(_("Clear Package Cache"))
+        compact_row_cache.set_subtitle(_("Free disk space from cached packages"))
+        compact_row_cache.add_prefix(Gtk.Image.new_from_icon_name("user-trash-symbolic"))
+        compact_row_cache.set_activatable(True)
+        compact_row_cache.connect("activated", self.on_clear_cache_clicked)
+        compact_bottom_actions_group.add(compact_row_cache)
+
+        compact_row_orphans = Adw.ActionRow()
+        compact_row_orphans.set_title(_("Remove Orphans"))
+        compact_row_orphans.set_subtitle(_("Remove unused dependency packages"))
+        compact_row_orphans.add_prefix(Gtk.Image.new_from_icon_name("edit-clear-all-symbolic"))
+        compact_row_orphans.set_activatable(True)
+        compact_row_orphans.connect("activated", self.on_remove_orphans_clicked)
+        compact_bottom_actions_group.add(compact_row_orphans)
+
+        compact_row_db_lock = Adw.ActionRow()
+        compact_row_db_lock.set_title(_("Remove DB Lock"))
+        compact_row_db_lock.set_subtitle(_("Delete /var/lib/pacman/db.lck"))
+        compact_row_db_lock.add_prefix(Gtk.Image.new_from_icon_name("channel-insecure-symbolic"))
+        compact_row_db_lock.set_activatable(True)
+        compact_row_db_lock.connect("activated", self.on_remove_db_lock_clicked)
+        compact_bottom_actions_group.add(compact_row_db_lock)
+
+        compact_center.append(compact_bottom_actions_group)
+
+        self.compact_panel_box.append(compact_center)
+        self.compact_panel_revealer = Gtk.Revealer()
+        self.compact_panel_revealer.set_transition_type(Gtk.RevealerTransitionType.SLIDE_LEFT)
+        self.compact_panel_revealer.set_transition_duration(250)
+        self.compact_panel_revealer.set_reveal_child(False)
+        self.compact_panel_revealer.set_halign(Gtk.Align.END)
+        self.compact_panel_revealer.set_vexpand(True)
+        self.compact_panel_revealer.set_child(self.compact_panel_box)
+        self.compact_overlay = Gtk.Overlay()
+        self.compact_overlay.set_hexpand(True)
+        self.compact_overlay.set_vexpand(True)
+        self.compact_overlay.add_overlay(self.compact_panel_revealer)
+        # Build the permanent widget tree (no reparenting ever)
+        self.right_revealer.set_child(self.right_pane)
+        self.content_hbox.append(self.content_stack)
+        self.content_hbox.append(self.right_revealer)
+        self.compact_overlay.set_child(self.content_hbox)
+        self.main_layout_box.append(self.compact_overlay)
+
+    def get_right_pane_min_width(self):
+        return RIGHT_PANE_MIN_WIDTH
+
+    def _monitor_adaptive_layout(self):
+        width = self.get_width()
+        if width <= 0 and self.window:
+            width = self.window.get_width()
+        if width > 0 and width != self.last_measured_width:
+            self.last_measured_width = width
+            self.update_adaptive_layout(current_width=width)
+        return True
+
+    def update_adaptive_layout(self, force=False, current_width=None):
+        width = current_width if current_width is not None else self.get_width()
+        if width <= 0 and self.window:
+            width = self.window.get_width()
+        use_wide_layout = width > WIDE_LAYOUT_THRESHOLD if width > 0 else False
+        if not force and use_wide_layout == self.wide_layout_enabled:
+            return False
+        self.wide_layout_enabled = use_wide_layout
+        if use_wide_layout:
+            self.set_margin_start(0)
+            self.set_margin_end(0)
+            self.content_stack.set_margin_start(12)
+            self.content_stack.set_margin_end(0)
+            self.compact_panel_revealer.set_reveal_child(False)
+            self.compact_sidebar_btn.handler_block(self._sidebar_toggled_handler)
+            self.compact_sidebar_btn.set_active(True)
+            self.compact_sidebar_btn.handler_unblock(self._sidebar_toggled_handler)
+            self.right_revealer.set_reveal_child(True)
+        else:
+            self.set_margin_start(12)
+            self.set_margin_end(12)
+            self.content_stack.set_margin_start(0)
+            self.content_stack.set_margin_end(0)
+            self.right_revealer.set_reveal_child(False)
+            self.compact_panel_revealer.set_reveal_child(False)
+            self.compact_sidebar_btn.handler_block(self._sidebar_toggled_handler)
+            self.compact_sidebar_btn.set_active(False)
+            self.compact_sidebar_btn.handler_unblock(self._sidebar_toggled_handler)
+        return False
