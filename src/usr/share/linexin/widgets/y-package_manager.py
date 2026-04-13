@@ -76,6 +76,10 @@ class LinexinPackageManager(Gtk.Box):
         threading.Thread(target=self.load_all_flatpak_ids, daemon=True).start()
         self.wide_layout_enabled = None
         self.last_measured_width = 0
+        self.top_stack = Gtk.Stack()
+        self.top_stack.set_transition_type(Gtk.StackTransitionType.CROSSFADE)
+        self.top_stack.set_hexpand(True)
+        self.top_stack.set_vexpand(True)
         self.main_layout_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=12)
         self.main_layout_box.set_hexpand(True)
         self.main_layout_box.set_vexpand(True)
@@ -92,7 +96,7 @@ class LinexinPackageManager(Gtk.Box):
         self.content_stack.set_transition_type(Gtk.StackTransitionType.SLIDE_LEFT_RIGHT)
         self.content_stack.set_hexpand(True)
         self.content_stack.set_vexpand(True)
-        self.append(self.main_layout_box)
+        self.append(self.top_stack)
         self.setup_warning_view()
         self.setup_search_view()
         self.setup_pkgbuild_view()
@@ -103,8 +107,9 @@ class LinexinPackageManager(Gtk.Box):
         GLib.timeout_add(200, self._monitor_adaptive_layout)
         self.connect("unrealize", self._on_unrealize)
         if self.should_show_warning():
-            self.content_stack.set_visible_child_name("warning_view")
+            self.top_stack.set_visible_child_name("warning_view")
         else:
+            self.top_stack.set_visible_child_name("main_view")
             self.content_stack.set_visible_child_name("search_view")
     def setup_custom_styles(self):
         css_provider = Gtk.CssProvider()
@@ -210,10 +215,11 @@ class LinexinPackageManager(Gtk.Box):
         self.dont_show_check.set_halign(Gtk.Align.CENTER)
         btn_box.append(self.dont_show_check)
         warn_box.append(btn_box)
-        self.content_stack.add_named(warn_box, "warning_view")
+        self.top_stack.add_named(warn_box, "warning_view")
     def on_warning_continue(self, btn):
         if self.dont_show_check.get_active():
             self.save_warning_preference(False)
+        self.top_stack.set_visible_child_name("main_view")
         self.content_stack.set_visible_child_name("search_view")
     def setup_search_view(self):
         search_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=10)
@@ -1946,6 +1952,7 @@ class LinexinPackageManager(Gtk.Box):
         self.content_hbox.append(self.right_revealer)
         self.compact_overlay.set_child(self.content_hbox)
         self.main_layout_box.append(self.compact_overlay)
+        self.top_stack.add_named(self.main_layout_box, "main_view")
 
     def get_right_pane_min_width(self):
         return RIGHT_PANE_MIN_WIDTH
