@@ -1,0 +1,139 @@
+
+        html, body {
+            background: transparent !important;
+            font-family: Cantarell, sans-serif !important;
+            margin: 0 !important;
+            padding: 0 16px !important;
+            font-size: 15px !important;
+            line-height: 1.6 !important;
+        }
+        /* Hide related-articles box and TOC */
+        .archwiki-template-meta-related-articles,
+        .toc, #toc, .mw-editsection { display: none !important; }
+
+        a { text-decoration: none !important; }
+        a:hover { text-decoration: underline !important; }
+
+        h1, h2, h3, h4, h5 { margin-top: 1.2em !important; }
+        h2 { padding-bottom: 4px !important; }
+
+        code { padding: 1px 5px !important; }
+        pre, code, kbd, .mw-highlight { border-radius: 6px !important; }
+        pre, .mw-highlight {
+            padding: 12px 16px !important;
+            overflow-x: auto !important;
+            line-height: 1.6 !important;
+        }
+        pre code { background: transparent !important; border: none !important;
+                   padding: 0 !important; }
+
+        table.wikitable { border-collapse: collapse !important; }
+        table.wikitable td, table.wikitable th { padding: 6px 10px !important; }
+
+        .archwiki-template-box,
+        .archwiki-template-box-note,
+        .archwiki-template-box-warning,
+        .archwiki-template-box-tip {
+            border-radius: 4px !important;
+            padding: 10px 14px !important;
+            margin: 12px 0 !important;
+        }
+
+        img { max-width: 100% !important; }
+        dl { margin-left: 1em !important; }
+        dt { font-weight: bold !important; }
+
+        /* ---- Dark mode ---- */
+        @media (prefers-color-scheme: dark) {
+            html, body { color: #e0e0e0 !important; }
+            a { color: #78aeed !important; }
+            a:visited { color: #a78aee !important; }
+            h1, h2, h3, h4, h5 { color: #ffffff !important; }
+            h2 { border-bottom: 1px solid rgba(255,255,255,0.12) !important; }
+            dt { color: #ffffff !important; }
+
+            pre, code, kbd, .mw-highlight {
+                background: rgba(255,255,255,0.07) !important;
+                color: #d8d8d8 !important;
+                border: 1px solid rgba(255,255,255,0.1) !important;
+            }
+
+            table.wikitable { border: 1px solid rgba(255,255,255,0.15) !important; }
+            table.wikitable th {
+                background: rgba(255,255,255,0.08) !important;
+                color: #ffffff !important;
+            }
+            table.wikitable td, table.wikitable th {
+                border: 1px solid rgba(255,255,255,0.15) !important;
+                color: #e0e0e0 !important;
+            }
+
+            .archwiki-template-box,
+            .archwiki-template-box-note,
+            .archwiki-template-box-warning,
+            .archwiki-template-box-tip {
+                background: rgba(255,255,255,0.05) !important;
+                border-left: 3px solid rgba(255,255,255,0.3) !important;
+                color: #e0e0e0 !important;
+            }
+            .archwiki-template-box-warning {
+                border-left-color: rgba(220,80,40,0.8) !important;
+                background: rgba(220,60,30,0.08) !important;
+            }
+            .archwiki-template-box-note {
+                border-left-color: rgba(80,150,230,0.8) !important;
+                background: rgba(60,120,230,0.08) !important;
+            }
+            .archwiki-template-box-tip {
+                border-left-color: rgba(60,190,80,0.8) !important;
+                background: rgba(40,170,60,0.08) !important;
+            }
+        }
+
+        /* ---- Light mode ---- */
+        @media (prefers-color-scheme: light) {
+            html, body { color: #1a1a1a !important; }
+            a { color: #1a73e8 !important; }
+            a:visited { color: #6a1b9a !important; }
+            h1, h2, h3, h4, h5 { color: #1a1a1a !important; }
+            h2 { border-bottom: 1px solid rgba(0,0,0,0.12) !important; }
+            dt { color: #1a1a1a !important; }
+
+            pre, code, kbd, .mw-highlight {
+                background: rgba(0,0,0,0.05) !important;
+                color: #2a2a2a !important;
+                border: 1px solid rgba(0,0,0,0.1) !important;
+            }
+
+            table.wikitable { border: 1px solid rgba(0,0,0,0.15) !important; }
+            table.wikitable th {
+                background: rgba(0,0,0,0.06) !important;
+                color: #1a1a1a !important;
+            }
+            table.wikitable td, table.wikitable th {
+                border: 1px solid rgba(0,0,0,0.15) !important;
+                color: #1a1a1a !important;
+            }
+
+            .archwiki-template-box,
+            .archwiki-template-box-note,
+            .archwiki-template-box-warning,
+            .archwiki-template-box-tip {
+                background: rgba(0,0,0,0.04) !important;
+                border-left: 3px solid rgba(0,0,0,0.2) !important;
+                color: #1a1a1a !important;
+            }
+            .archwiki-template-box-warning {
+                border-left-color: rgba(200,50,20,0.7) !important;
+                background: rgba(220,60,30,0.06) !important;
+            }
+            .archwiki-template-box-note {
+                border-left-color: rgba(30,100,210,0.7) !important;
+                background: rgba(30,100,210,0.06) !important;
+            }
+            .archwiki-template-box-tip {
+                border-left-color: rgba(30,150,50,0.7) !important;
+                background: rgba(30,150,50,0.06) !important;
+            }
+        }
+    
